@@ -11,6 +11,7 @@ const UNSUPPORTED_JSON_KEY_ERR: &str = "cannot make a JSON object key from a key
 const RECURSIVE_TABLE_ERR: &str = "cannot convert to JSON a table that contains itself";
 const TOO_DEEP_ERR: &str = "cannot convert to JSON tables nested deeper than";
 pub(crate) const UNKNOWN_FIELD_ERR: &str = "unknown field";
+pub(crate) const REQUIRED_ERR: &str = "is required";
 
 /// How many nulls an array encoding may invent for keys the table does not
 /// hold. A JSON null arrives as an absent Lua key, so a round trip has to be
@@ -63,6 +64,11 @@ impl TableExt for Table {
     fn opt<T: FromLua>(&self, key: &str) -> LuaResult<Option<T>> {
         Ok(self.get::<NilAsNone<T>>(key)?.0)
     }
+}
+
+pub(crate) fn required<T: mlua::FromLua>(opts: &Table, context: &str, key: &str) -> LuaResult<T> {
+    opts.opt::<T>(key)?
+        .ok_or_else(|| mlua::Error::runtime(format!("{context}: '{key}' {REQUIRED_ERR}")))
 }
 
 /// Throws on a key of {table} outside {allowed}, so a typo is an error
