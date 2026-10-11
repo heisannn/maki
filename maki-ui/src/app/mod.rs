@@ -193,10 +193,6 @@ impl InputWriter {
         }
     }
 
-    fn take(&mut self) -> Self {
-        mem::take(self)
-    }
-
     fn into_source(self, current_version: u64) -> Option<Arc<str>> {
         match self {
             Self::Plugin(name, version) if version == current_version => Some(name),
@@ -416,10 +412,11 @@ pub struct App {
     /// than the session's stored one: a restored session may name another
     /// model, and the event loop swaps the live one in on the first tick.
     announced_model_spec: String,
-    /// The value Lua was last told about. A fast typist would otherwise wake
-    /// every handler once per keystroke.
-    announced_input: String,
-    /// The caret Lua was last told about, diffed alongside the value so a
+    /// The version of the value Lua was last told about. A fast typist would
+    /// otherwise wake every handler once per keystroke. Comparing versions
+    /// instead of text keeps an idle tick from touching the whole value.
+    announced_version: u64,
+    /// The caret Lua was last told about, diffed alongside the version so a
     /// caret that moved on its own is reported once and a frame that moved
     /// neither is silent.
     announced_cursor: usize,
@@ -534,7 +531,7 @@ impl App {
             model_policy: Arc::clone(&model_policy),
             lua_event_handle,
             announced_model_spec: model.spec(),
-            announced_input: String::new(),
+            announced_version: 0,
             announced_cursor: 0,
             input_writer: InputWriter::Untouched,
             input_fired_this_frame: false,
@@ -728,41 +725,31 @@ impl App {
         Ok(serde_json::json!(true))
     }
 
-    /// The only paths that can name a writer. Submit, discard, history recall
-    /// and `$EDITOR` change the value without coming through here, and the
-    /// tick diff reports those unlabelled: the version stamped here no longer
-    /// matches what they left.
+    /// The only path that can name a writer, see [`InputWriter`].
     fn input_changed(&mut self, writer: InputWriter) {
-        self.input_writer = self.input_writer.take().merge(writer);
+        self.input_writer = mem::take(&mut self.input_writer).merge(writer);
     }
 
-    /// One event per frame at most, and only when the caret or the text
-    /// really moved, so holding a key down wakes a handler once and a frame
-    /// that moved nothing leaves it asleep.
+    /// One event per frame at most, and only when the version or the caret
+    /// changed, so holding a key down wakes a handler once and a frame that
+    /// changed neither leaves it asleep.
     ///
     /// A caret that moved on its own fires too, with `cursor_only` set. An
     /// input plugin anchored to what the caret is sitting in has no other way
     /// to learn it left: a popup on an `@` mention would stay up holding
     /// `<CR>` for a mention the user has arrowed out of.
     fn tick_input_changed(&mut self) -> Dirty {
-        let value = self.input_box.buffer.value();
+        let version = self.input_box.buffer.version();
         let cursor = self.input_box.buffer.cursor_byte();
         self.input_fired_this_frame =
-            value != self.announced_input || cursor != self.announced_cursor;
+            version != self.announced_version || cursor != self.announced_cursor;
         if !self.input_fired_this_frame {
             self.input_writer = InputWriter::Untouched;
             return Dirty::NO;
         }
-        // The value is the trigger and the writer only a label: submit,
-        // discard, history recall, a draft restored on a session switch and
-        // $EDITOR all change the value without passing a path that could set a
-        // writer flag.
-        let source = self
-            .input_writer
-            .take()
-            .into_source(self.input_box.buffer.version());
-        let cursor_only = value == self.announced_input;
-        self.announced_input = value;
+        let source = mem::take(&mut self.input_writer).into_source(version);
+        let cursor_only = version == self.announced_version;
+        self.announced_version = version;
         self.announced_cursor = cursor;
         self.fire_input_changed(source, cursor_only);
         Dirty::NO
@@ -788,14 +775,14 @@ impl App {
         if mem::take(&mut self.input_fired_this_frame) {
             return;
         }
-        self.announced_input = self.input_box.buffer.value();
+        self.announced_version = self.input_box.buffer.version();
         self.announced_cursor = self.input_box.buffer.cursor_byte();
         self.fire_input_changed(None, false);
     }
 
     fn fire_input_changed(&mut self, source: Option<Arc<str>>, cursor_only: bool) {
         self.fire_session_event(HostEvent::InputChanged {
-            text: &self.announced_input,
+            text: self.input_box.buffer.value(),
             cursor: self.announced_cursor,
             version: self.input_box.buffer.version(),
             source: source.as_deref(),
@@ -1188,7 +1175,7 @@ impl App {
                     return Some(self.execute_command(cmd, 0));
                 }
                 CommandAction::Complete(text) => {
-                    self.input_box.set_input(text);
+                    self.input_box.set_input(&text);
                     self.input_box.buffer.move_to_end();
                     self.input_changed(InputWriter::Anyone);
                     return Some(vec![]);
