@@ -28,7 +28,8 @@ use super::Change;
 
 /// A hundred thousand marks make a few hundred chunks to step over per edit,
 /// and remapping the one chunk under the edit stays a few hundred marks.
-const CHUNK_LEN: usize = 256;
+/// Tests cut tiny chunks, so the few marks the fuzzer places span several.
+const CHUNK_LEN: usize = if cfg!(test) { 2 } else { 256 };
 /// A rule mark uses its rule's place in the list as its rank. Ranks of
 /// placed marks start above every such place, so a mark a plugin placed by
 /// hand draws over one a rule made.
@@ -376,17 +377,21 @@ pub(super) fn remap_mark(mark: &mut Mark, change: &Change) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::text_buffer::TextBuffer;
-    use crate::text_buffer::test_support::text_edit;
+    use std::ops::Range;
     use std::sync::Arc;
+
+    use fastrand::Rng;
     use test_case::test_case;
+
+    use super::{CHUNK_LEN, Decoration, Mark, Marks, remap_mark};
+    use crate::text_buffer::TextBuffer;
+    use crate::text_buffer::fuzz::Odds;
+    use crate::text_buffer::test_support::text_edit;
 
     const PLUGIN: &str = "test";
     const NS: &str = "marks";
     const TEXT: &str = "0123456789";
-    const LCG_MUL: u64 = 6364136223846793005;
-    const LCG_INC: u64 = 1442695040888963407;
+    const SEED: u64 = 7;
 
     #[derive(Clone, Copy)]
     enum Kind {
@@ -469,7 +474,7 @@ mod tests {
             .unwrap();
         let wrap = |at| text_edit(at, at, "**");
         buffer
-            .apply_edits(buffer.version(), vec![wrap(4), wrap(8)], None, None)
+            .apply_edits(buffer.version(), vec![wrap(4), wrap(8)], None, None, None)
             .unwrap();
         assert_eq!(ranges(buffer.marks()), vec![6..10]);
     }
@@ -482,29 +487,28 @@ mod tests {
     /// way every time.
     #[test]
     fn chunks_map_like_marks_mapped_one_by_one() {
-        const MARKS: usize = CHUNK_LEN * 6;
+        const MARKS: usize = CHUNK_LEN * 60;
         const EDITS: usize = 300;
         const MAX_MARK_LEN: usize = 8;
         const POINT_ODDS: usize = 5;
         const LINE: &str = "abcdefghij\n";
-        let mut seed: u64 = 7;
-        let mut roll = |below: usize| {
-            seed = seed.wrapping_mul(LCG_MUL).wrapping_add(LCG_INC);
-            (seed >> 33) as usize % below
-        };
+        const TEXTS: [&str; 4] = ["", "x", "yz\n", "long insert"];
+        let mut rng = Rng::with_seed(SEED);
 
         let mut buffer = TextBuffer::new(LINE.repeat(MARKS / 4));
         let kinds = [Kind::Plain, Kind::Conceal, Kind::Atomic];
-        let mut marks = Vec::with_capacity(MARKS);
-        for _ in 0..MARKS {
-            let start = roll(buffer.value().len() - MAX_MARK_LEN);
-            let stop = (roll(POINT_ODDS) > 0).then(|| start + 1 + roll(MAX_MARK_LEN - 1));
-            marks.push(Mark {
-                start,
-                stop,
-                decoration: decoration(kinds[roll(kinds.len())]),
-            });
-        }
+        let marks: Vec<Mark> = (0..MARKS)
+            .map(|_| {
+                let start = rng.usize(..buffer.value().len() - MAX_MARK_LEN);
+                let stop =
+                    (!rng.one_in(POINT_ODDS)).then(|| start + 1 + rng.usize(..MAX_MARK_LEN - 1));
+                Mark {
+                    start,
+                    stop,
+                    decoration: decoration(rng.pick(&kinds)),
+                }
+            })
+            .collect();
         buffer
             .set_marks(buffer.version(), PLUGIN, NS, marks.clone())
             .unwrap();
@@ -520,12 +524,13 @@ mod tests {
                 .flat_map(|ns| &ns.plain)
                 .flat_map(|chunk| [chunk.first(), chunk.last()])
                 .collect();
-            let start = match roll(2) {
-                0 if !edges.is_empty() => edges[roll(edges.len())],
-                _ => roll(len + 1),
+            let start = if rng.bool() && !edges.is_empty() {
+                rng.pick(&edges)
+            } else {
+                rng.usize(..=len)
             };
-            let stop = (start + roll(4) * roll(3)).min(len);
-            let text = ["", "x", "yz\n", "long insert"][roll(4)];
+            let stop = (start + rng.usize(..4) * rng.usize(..3)).min(len);
+            let text = rng.pick(&TEXTS);
             let seen = buffer.version();
             buffer.replace_byte_range(start, stop, text, None).unwrap();
             for change in buffer.changes_since(seen).unwrap() {

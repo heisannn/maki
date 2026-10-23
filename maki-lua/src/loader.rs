@@ -1872,6 +1872,7 @@ mod tests {
                     session_id: SESSION.into(),
                     text: TEXT.into(),
                     cursor: TEXT.len(),
+                    anchor: None,
                     version: VERSION,
                 });
                 pressed = Some(t.id());
@@ -2009,6 +2010,7 @@ mod tests {
                     session_id: String::new(),
                     text: PASTED.into(),
                     cursor: 0,
+                    anchor: None,
                     version: 0,
                 })
                 .with_text(PASTED.into());
