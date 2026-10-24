@@ -6,7 +6,7 @@ use crate::agent::shared_queue;
 use crate::app::tasks::TaskStatus;
 use crate::chat::{CANCELLED_TEXT, DONE_TEXT, ERROR_TEXT, INBOX_DROPPED_SUFFIX};
 use crate::components::btw_modal::BtwEvent;
-use crate::components::command::{ParsedCommand, USER_ONLY_SUFFIX};
+use crate::components::command::{PROMPT_NEEDS, ParsedCommand, USER_ONLY_SUFFIX};
 use crate::components::file_picker::UNREADABLE_DIR_MSG;
 use crate::components::keybindings::{KeybindContext, key as kb};
 use crate::components::messages::ScrollPos;
@@ -40,7 +40,7 @@ use maki_lua::test_support::{
     probed_event_handle, set_mode,
 };
 use maki_lua::{
-    BuiltinAction, Dimension, FloatConfig, HintReader, InputRequest, InputRulesReader,
+    BuiltinAction, Dimension, FloatConfig, HintReader, InputRequest, InputRulesReader, InputSubmit,
     KeybindTicket, KeymapReader, LuaCommandInfo, LuaCommandReader, Missing, PASTE, PackCommand,
     PackPlan, PackPreparation, PackReport, Permission, PluginHost, PluginPermissions,
     SessionEndReason, Split, TextEdit, UiAction, WinCommand, WinEvent,
@@ -6905,6 +6905,16 @@ fn serve_handler(app: &mut App, ui: &flume::Receiver<UiAction>) -> (Vec<String>,
                 asked.push(ASKED_EDIT.into());
                 let _ = reply_tx.send(app.apply_input_edit(edit, TEST_AREA));
             }
+            UiAction::Input {
+                req: InputRequest::Submit(req),
+                reply_tx,
+            } => {
+                let reply = app.submit_input(req, TEST_AREA).map(|sent| {
+                    actions.extend(sent);
+                    serde_json::json!(true)
+                });
+                let _ = reply_tx.send(reply);
+            }
             UiAction::KeybindFallback(ticket) => {
                 asked.push(ASKED_FALLBACK.into());
                 actions.extend(app.keybind_fallback(ticket));
@@ -7036,6 +7046,121 @@ fn an_enter_held_while_a_handler_changed_the_input_sends_nothing(
     assert_eq!(app.input_box.buffer.value(), left);
     assert_eq!(app.status_bar.flash_text(), flash);
     assert!(!app.permissions.is_yolo());
+}
+
+/// The first send uses the version it read, which its own edit just made
+/// stale, and flashes the refusal so the test can see it.
+const SUBMIT_PLUGIN: &str = r#"
+maki.keymap.set("i", "<CR>", function(ev)
+    local st = ev.input
+    local edited = maki.ui.input_edit({
+        start = #st.text, stop = #st.text, text = "!",
+        version = st.version, session_id = st.session_id,
+    })
+    local ok, err = maki.ui.input_submit({ version = st.version, session_id = st.session_id })
+    if not ok then maki.ui.flash(err) end
+    maki.ui.input_submit({ version = edited.version, session_id = st.session_id })
+end)
+"#;
+
+/// The first message starts the agent, so the second one has to wait in the
+/// queue.
+#[test]
+fn a_handler_edits_then_submits_like_a_typed_enter() {
+    let (_host, mut app, ui) = plugin_app("shout", SUBMIT_PLUGIN);
+
+    type_keys(&mut app, "hi");
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    let (asked, actions) = serve_handler(&mut app, &ui);
+    let [edit, refusal] = &asked[..] else {
+        panic!("{asked:?}");
+    };
+    assert_eq!(edit, ASKED_EDIT);
+    assert!(refusal.starts_with(STALE_VERSION_ERR), "{refusal}");
+    assert!(matches!(&actions[..], [Action::SendMessage(s)] if s.message == "hi!"));
+    assert_eq!(app.input_box.buffer.value(), "");
+
+    type_keys(&mut app, "more");
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    let (_, actions) = serve_handler(&mut app, &ui);
+    assert!(!actions.iter().any(|a| matches!(a, Action::SendMessage(_))));
+    assert_eq!(app.queue.text_messages(), ["more!"]);
+
+    app.input_box.history_up();
+    assert_eq!(app.input_box.buffer.value(), "more!");
+    app.input_box.history_up();
+    assert_eq!(app.input_box.buffer.value(), "hi!");
+}
+
+fn current_submit(app: &App, caller: PluginReach) -> InputSubmit {
+    let st = app.input_snapshot();
+    InputSubmit {
+        version: st["version"].as_u64().unwrap(),
+        session_id: st["session_id"].as_str().unwrap().into(),
+        caller,
+    }
+}
+
+/// The agent is busy, so a message that got out would sit in the queue next
+/// to the one already there. A user-only command is left to the user.
+#[test_case(|_| {}, "/yolo", &format!("/yolo{USER_ONLY_SUFFIX}") ; "a_user_only_command")]
+#[test_case(|app| app.help_modal.toggle(), "hello", SUBMIT_NOT_LIVE_ERR ; "a_modal_is_open")]
+#[test_case(|app| app.queue.set_focus_at(0), "hello", SUBMIT_NOT_LIVE_ERR ; "the_queue_has_the_keyboard")]
+#[test_case(|_| {}, "  ", NOTHING_TO_SEND_ERR ; "blank")]
+#[test_case(|app| app.command_palette.unselect(&app.input_box.buffer), "/help", NO_COMMAND_MATCHED_ERR ; "the_palette_swallows_enter")]
+fn a_submit_is_refused_where_enter_would_not_send(setup: fn(&mut App), text: &str, err: &str) {
+    let mut app = app_with_queued_message();
+    type_keys(&mut app, text);
+    setup(&mut app);
+
+    let req = current_submit(&app, trusted());
+    assert_eq!(app.submit_input(req, TEST_AREA).err().as_deref(), Some(err));
+    assert_eq!(app.input_box.buffer.value(), text);
+    assert_eq!(app.queue.len(), 1);
+    assert!(!app.permissions.is_yolo());
+}
+
+#[test]
+fn a_submitted_slash_command_runs_like_enter() {
+    let mut app = test_app();
+    type_keys(&mut app, "/help");
+
+    let req = current_submit(&app, trusted());
+    app.submit_input(req, TEST_AREA).unwrap();
+    assert!(app.help_modal.is_open());
+    assert_eq!(app.input_box.buffer.value(), "");
+}
+
+/// A plugin's submit needs what doing the same thing directly needs. Holding
+/// only those grants is enough, and lacking any one of them is not.
+#[test_case(test_app, "hello", SEND_MESSAGE, PROMPT_NEEDS ; "a_message")]
+#[test_case(app_with_queued_message, "hello", SEND_MESSAGE, PROMPT_NEEDS ; "a_message_for_the_queue")]
+#[test_case(test_app, "!ls", RUN_SHELL_LINE, &[Permission::Run] ; "a_shell_line")]
+#[test_case(test_app, "!! ls", RUN_SHELL_LINE, &[Permission::Run] ; "a_hidden_shell_line")]
+#[test_case(test_app, "/btw hi", "/btw", &[Permission::Agent] ; "a_command_that_starts_a_turn")]
+fn a_submit_needs_the_grant_of_what_enter_would_do(
+    app: fn() -> App,
+    text: &str,
+    what: &str,
+    needed: &[Permission],
+) {
+    let mut app = app();
+    type_keys(&mut app, text);
+    let queued = app.queue.len();
+
+    for &permission in needed {
+        let refused = app.submit_input(current_submit(&app, without(permission)), TEST_AREA);
+        assert_eq!(
+            refused.err(),
+            Some(Missing::Permission(permission).refusal(what))
+        );
+        assert_eq!(app.input_box.buffer.value(), text);
+        assert_eq!(app.queue.len(), queued);
+    }
+
+    app.submit_input(current_submit(&app, only_these(needed)), TEST_AREA)
+        .unwrap();
+    assert_eq!(app.input_box.buffer.value(), "");
 }
 
 const PLAIN_LINE: &str = "say hi";
@@ -7310,6 +7435,21 @@ fn a_plugin_that_wrote_twice_is_named_once() {
         press_enter(&mut app).err(),
         Some(written(WRITER, WRITTEN_COMMAND, &reason))
     );
+}
+
+/// A plugin that sends the text answers for itself and for the plugin that
+/// wrote it.
+#[test]
+fn a_submit_needs_the_grants_of_the_writer_too() {
+    let mut app = test_app();
+    write_as(&mut app, SHELL_LINE, named(only(Permission::Input)));
+
+    let refused = app.submit_input(current_submit(&app, trusted()), TEST_AREA);
+    assert_eq!(
+        refused.err(),
+        Some(written(WRITER, WRITTEN_SHELL_LINE, &run_refused()))
+    );
+    assert_eq!(app.input_box.buffer.value(), SHELL_LINE);
 }
 
 /// What a line may do is weighed at Enter, so a vim mode moves, selects
@@ -7686,6 +7826,56 @@ fn a_burst_through_slow_handlers_lands_in_order(body: &str, bound_lands_as: &str
 
     let expected = typed.replace(BURST_BOUND, bound_lands_as);
     assert_eq!(app.input_box.buffer.value(), format!("{expected}z"));
+}
+
+const EDITED_FLASH: &str = "edited";
+const SUBMIT_EDITED: &str =
+    "maki.ui.input_submit({ version = edited.version, session_id = st.session_id })";
+
+/// Whatever the handler did before its fallback lands first, and the keys
+/// typed behind it come after both, so none of them is sent. The fallback
+/// never sends what the handler wrote, the submit does.
+#[test_case("", &[], "hi!next" ; "the_fallback_sends_nothing")]
+#[test_case(SUBMIT_EDITED, &["hi!"], "next" ; "the_submit_sends_and_the_fallback_finds_nothing")]
+fn a_handler_edits_and_falls_back_before_the_keys_behind_it(
+    submit: &str,
+    sent: &[&str],
+    left: &str,
+) {
+    const TYPED_BEHIND: &str = "next";
+    let (_host, mut app, ui) = plugin_app(
+        "shout",
+        &format!(
+            r#"
+            maki.keymap.set("i", "<CR>", function(ev)
+                local st = ev.input
+                local edited = maki.ui.input_edit({{
+                    start = #st.text, stop = #st.text, text = "!",
+                    version = st.version, session_id = st.session_id,
+                }})
+                maki.ui.flash("{EDITED_FLASH}")
+                {submit}
+                ev.fallback()
+            end)
+            "#
+        ),
+    );
+    type_keys(&mut app, "hi");
+
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    type_keys(&mut app, TYPED_BEHIND);
+    let (asked, actions) = serve_handler(&mut app, &ui);
+
+    assert_eq!(asked, [ASKED_EDIT, EDITED_FLASH, ASKED_FALLBACK]);
+    let sends: Vec<_> = actions
+        .iter()
+        .filter_map(|a| match a {
+            Action::SendMessage(s) => Some(s.message.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(sends, sent);
+    assert_eq!(app.input_box.buffer.value(), left);
 }
 
 /// The handler moves the keyboard from tab to tab before it is done. The

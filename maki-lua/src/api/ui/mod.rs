@@ -12,8 +12,8 @@ use crate::api::action::run_plugin_action;
 use crate::api::keymap::{InputMode, accept_key, switch_mode};
 use crate::api::util::command::{
     Anchor, Border, BuiltinAction, Dimension, FloatConfig, HintEntries, HintWriter, InputDecorate,
-    InputEdit, InputMarks, InputRequest, Split, TextEdit, TitlePos, UiAction, WinCommand, WinEvent,
-    ui_json_roundtrip, ui_roundtrip, ui_send,
+    InputEdit, InputMarks, InputRequest, InputSubmit, Split, TextEdit, TitlePos, UiAction,
+    WinCommand, WinEvent, ui_json_roundtrip, ui_roundtrip, ui_send,
 };
 use crate::api::util::convert::{TableExt, reject_unknown_fields, required};
 use crate::api::util::pair::{Pair, err_pair, try_pair};
@@ -35,6 +35,7 @@ use win::{WinHandle, WinSender};
 const UI_STYLE_FIELDS: usize = 8;
 const INPUT_EDIT: &str = "input_edit";
 const INPUT_DECORATE: &str = "input_decorate";
+const INPUT_SUBMIT: &str = "input_submit";
 const SINGLE_EDIT_KEYS: [&str; 3] = ["start", "stop", "text"];
 const NOT_A_LIST_ERR: &str = "is a list of tables, so wrap a single one in {}";
 const MIXED_EDIT_SHAPES_ERR: &str =
@@ -57,6 +58,9 @@ const EDIT_OPTIONS: &[&str] = &[
     "ns",
 ];
 const DECORATE_OPTIONS: &[&str] = &["session_id", "version", "ns", "marks"];
+/// A `text` field would read as "send this", but what goes out is always the
+/// text on screen, so it is refused.
+const SUBMIT_OPTIONS: &[&str] = &["session_id", "version"];
 const INPUT_RULES: &str = "input_rules";
 const RULE_OPTIONS: &[&str] = &["ns", "pattern", "mark", "treesitter"];
 const RULE_HALVES_ERR: &str = "input_rules: 'pattern' and 'mark' go together";
@@ -502,8 +506,8 @@ fn set_mode(lua: &Lua, #[ctx] plugin: Arc<str>, mode: String) -> LuaResult<()> {
 /// one its loaded plugin never registered.
 ///
 /// To try several actions on one key, see
-/// [Composing keys](/docs/keybindings/#composing-keys). For slash commands,
-/// see `maki.api.run_command`.
+/// [Composing keys](/docs/keybindings/#composing-keys). To send the input,
+/// use `maki.ui.input_submit`. For slash commands, see `maki.api.run_command`.
 ///
 /// @param name string Action name, e.g. `"file_picker"` or `"completion.accept"`.
 /// @return (boolean|nil, string|nil) Whether the action handled it, or nil and an error.
@@ -615,10 +619,6 @@ fn table_list(list: Table, func: &str, key: &str) -> LuaResult<Vec<Table>> {
 /// - `strict` is set and `version` is not current.
 /// - A range ends past the end of the text, or an offset falls inside a
 ///   multi-byte character.
-/// - The user cannot see the chat input, so the text would be sent later
-///   without being read. This happens while a permission prompt, the plan
-///   form or a `below` split takes its place, or a picker, a modal or a
-///   focused plugin window covers it.
 ///
 /// Enter checks the text you write before it runs it, see
 /// [chat input](#chat-input). For marks alone, use `input_decorate`, which
@@ -781,6 +781,77 @@ async fn input_decorate(
         return Ok(err_pair(UNLOADED_MARKS_ERR));
     }
     input_roundtrip(lua, tx.as_ref(), InputRequest::Decorate(decorate)).await
+}
+
+/// Sends the chat input the way Enter does, `/` commands, `!` lines, images,
+/// the queue and the history included. Only a `\` before the cursor differs:
+/// Enter turns it into a new line, and `input_submit` sends it as it is.
+///
+/// Use it to send what a key handler wrote, since `ev.fallback()` on `<CR>`
+/// refuses text that changed after the press, see
+/// [`maki.keymap.set`](/docs/lua-api/#maki-keymap-set).
+///
+/// It sends only while the input still holds `version`, so what goes out is
+/// the text your plugin planned against. After your own edit, pass the
+/// version `input_edit` returned. In a key handler, `ev.input.version` is
+/// the version at the press. Any other change makes the version stale, like
+/// an edit of another plugin or a key that landed after the one second keys
+/// wait for a handler.
+///
+/// A send needs the [plugin permissions](/docs/lua-api/#plugin-permissions)
+/// that doing the same thing directly needs:
+///
+/// - A message needs `agent` and `session_write`, like
+///   `maki.session.prompt`, also when it waits in the queue or is the retry
+///   Enter sends after a login.
+/// - A `!` or `!!` line needs `run`.
+/// - A `/` command needs what `maki.api.run_command` needs for it, so
+///   `/yolo`, `/trust`, `/packupdate` and `/packdel` always fail.
+///
+/// Besides the cases in [offsets and versions](#offsets-and-versions), the
+/// call fails, and the input stays as it is, when:
+///
+/// - The message queue has the keyboard after `/queue`.
+/// - There is nothing to send, or the command palette is open with no
+///   command to run.
+/// - Your plugin lacks a permission listed above.
+/// - A plugin changed the text, and Enter would refuse it for that plugin,
+///   see [chat input](#chat-input).
+///
+/// @param opts table Options:
+///   `version` (integer) the version of the text to send, from `maki.ui.input`, `ev.input` or `input_edit`.
+///   `session_id` (string) the tab the version was read from.
+/// @return (boolean|nil, string|nil) `true` once sent, or nil and an error.
+/// @example
+/// -- Spell out `lgtm` before sending:
+/// maki.keymap.set("i", "<CR>", function(ev)
+///   local st = ev.input
+///   local s, e = st.text:find("lgtm", 1, true)
+///   local version = st.version
+///   if s then
+///     local r = maki.ui.input_edit({
+///       start = s - 1, stop = e, text = "looks good to me",
+///       version = st.version, session_id = st.session_id,
+///     })
+///     if not r then return end
+///     version = r.version
+///   end
+///   maki.ui.input_submit({ version = version, session_id = st.session_id })
+/// end)
+#[lua_fn]
+async fn input_submit(
+    lua: Lua,
+    #[ctx] tx: Option<flume::Sender<UiAction>>,
+    #[ctx] caller: PluginReach,
+    opts: Table,
+) -> LuaResult<Pair<mlua::Value>> {
+    reject_unknown_fields(&opts, SUBMIT_OPTIONS, INPUT_SUBMIT)?;
+    let req = InputRequest::Submit(InputSubmit {
+        version: required(&opts, INPUT_SUBMIT, "version")?,
+        session_id: required(&opts, INPUT_SUBMIT, "session_id")?,
+        caller: caller.now(&lua),
+    });
+    input_roundtrip(lua, tx.as_ref(), req).await
 }
 
 /// Sets a rule that marks the chat input in every tab, from a regex or a
@@ -1088,9 +1159,9 @@ lua_table! {
     /// Without a UI (`maki -p`, the sdk, ACP), buffers and the text helpers
     /// still work. The calls that need a screen behave like this:
     ///
-    /// - `input`, `input_edit`, `input_decorate`, and `action` on a built-in
-    ///   name return `nil, "no interactive UI attached"`. Plugin actions
-    ///   still run.
+    /// - `input`, `input_edit`, `input_decorate`, `input_submit`, and `action`
+    ///   on a built-in name return `nil, "no interactive UI attached"`.
+    ///   Plugin actions still run.
     /// - `open_editor` returns -1.
     /// - `flash` writes to the log.
     /// - `open_win`, `set_status_hint`, `set_window_title`, `set_mode` and `input_rules` have no effect.
@@ -1098,8 +1169,7 @@ lua_table! {
     ///
     /// ### Chat input
     ///
-    /// Plugins can read, change and style what the user types in the chat
-    /// input. Pick the call by the job:
+    /// Plugins can read, style, change and send the chat input:
     ///
     /// | Job | Call |
     /// | --- | --- |
@@ -1107,28 +1177,45 @@ lua_table! {
     /// | Style text by what it says, like a `$skill:go` chip | [`input_rules`](#maki-ui-input_rules) |
     /// | Style text from plugin state, like ghost text or diagnostics | [`input_decorate`](#maki-ui-input_decorate) |
     /// | Change the text, the cursor or the selection | [`input_edit`](#maki-ui-input_edit) |
+    /// | Send the input, as Enter does | [`input_submit`](#maki-ui-input_submit) |
     /// | React when the input changes | the `InputChanged` [event](#maki-api-create_autocmd) |
+    /// | Switch to normal mode for a vim mode | [`set_mode`](#maki-ui-set_mode), see [Modes](/docs/lua-api/#modes) |
     ///
-    /// Prefer `input_rules` when the look follows from the text. A rule runs
+    /// A key that types `TODO: ` at the cursor:
+    ///
+    /// ```lua
+    /// maki.keymap.set("i", "<M-t>", function(ev)
+    ///   local st = ev.input
+    ///   maki.ui.input_edit({
+    ///     start = st.cursor, stop = st.cursor, text = "TODO: ",
+    ///     version = st.version, session_id = st.session_id,
+    ///   })
+    /// end)
+    /// ```
+    ///
+    /// When the look follows from the text, prefer `input_rules`. A rule runs
     /// no Lua per keystroke, and its marks are right again after undo, redo,
     /// a history recall or a chat switch.
     ///
-    /// `input`, `input_edit` and `input_decorate` wait for the UI to answer.
-    /// They work from any callback, like a key handler, an autocmd or
-    /// `maki.defer_fn`, but not while your plugin loads.
+    /// The calls other than `input_rules` wait for the UI to answer. They work
+    /// from any callback, like a key handler or an autocmd. While your plugin
+    /// loads, they return `nil` and an error.
     ///
-    /// Changing the chat input needs the `input` permission. That covers its
-    /// text, its cursor and its selection, since your next Enter sends the
-    /// text and your next key lands at the cursor. It covers `input_edit` and
-    /// the built-in [actions](#maki-ui-action) that change the input, like
-    /// `undo` or a history recall. Without `input` they raise
-    /// `permission denied`. A plugin without it can still read the input and
-    /// style it with `input_rules` and `input_decorate`. Your own `init.lua`
-    /// needs a `plugin.toml` next to it for this, like any plugin, see
-    /// [plugin permissions](#plugin-permissions).
+    /// Changing the text, the cursor or the selection needs the `input`
+    /// [permission](#plugin-permissions), because your next Enter sends the
+    /// text and your next key lands at the cursor. This covers `input_edit`
+    /// and the built-in [actions](#maki-ui-action) that edit, like `undo` or
+    /// a history recall. `input_edit` needs `session_read` as well. Without
+    /// them they raise `permission denied`.
     ///
-    /// With `input` you may write any text. Enter then checks every plugin
-    /// that changed it:
+    /// Reading the input needs `session_read`. This covers `maki.ui.input`,
+    /// `ev.input` and `ev.text` in a key handler, and a global binding in
+    /// `"i"` on a key that types text, see
+    /// [`maki.keymap.set`](#maki-keymap-set). Styling the input needs no
+    /// permission.
+    ///
+    /// A plugin with `input` may write any text. Before Enter runs the text,
+    /// it checks each plugin that wrote it:
     ///
     /// | Text starts with | Each plugin that wrote it needs |
     /// | --- | --- |
@@ -1167,13 +1254,13 @@ lua_table! {
     ///
     /// The calls work on the input of the focused tab. `input`, the
     /// `InputChanged` event and `ev.input` of a key handler report its
-    /// `version` and `session_id`, and `input_edit` and `input_decorate` need
-    /// both. Every tab counts versions from zero, so a version alone cannot
-    /// tell two tabs apart.
+    /// `version` and `session_id`. Pass both to `input_edit`,
+    /// `input_decorate` and `input_submit`. Each tab counts versions from
+    /// zero, so a version alone cannot tell two tabs apart.
     ///
     /// The user may type between your read and your call. `input_edit` and
-    /// `input_decorate` then move your offsets past what was typed. Both
-    /// refuse when:
+    /// `input_decorate` then move your offsets past what was typed, and
+    /// `input_submit` fails. All three fail when:
     ///
     /// - `session_id` names a tab that is not focused.
     /// - The text was replaced since: a history recall, a chat switch that
@@ -1181,7 +1268,13 @@ lua_table! {
     /// - So much changed since `version` that the offsets can no longer be
     ///   moved.
     ///
-    /// A refusal returns `nil` and an error message. Read the input again
+    /// `input_edit` and `input_submit` also fail while the chat input is
+    /// hidden, since the user could not read what gets sent. It is hidden
+    /// while a permission prompt, the plan form or a `below` split takes its
+    /// place, or while a picker, a modal or a focused plugin window covers
+    /// it. `input_decorate` still works then.
+    ///
+    /// A failed call returns `nil` and an error message. Read the input again
     /// and retry. Bad arguments, like a missing or an unknown field, throw.
     ///
     /// ### Input marks
@@ -1230,8 +1323,8 @@ lua_table! {
         buf, theme_color, theme_style, highlight, markdown, humantime, terminal_size,
         display_width, truncate_text,
         manual set_mode, manual flash, manual action, manual open_editor, manual open_win, manual set_status_hint,
-        manual set_window_title, manual input, manual input_edit, manual input_decorate,
-        manual input_rules,
+        manual set_window_title, manual input, manual input_rules, manual input_decorate,
+        manual input_edit, manual input_submit,
     ]
 }
 
@@ -1266,6 +1359,7 @@ pub(crate) fn create_ui_table(
     )?;
     input_decorate__register(&t, lua, ui_action_tx.clone(), Arc::clone(&plugin))?;
     input_rules__register(&t, lua, Arc::clone(&plugin))?;
+    input_submit__register(&t, lua, ui_action_tx.clone(), reach)?;
     open_win__register(&t, lua, ui_action_tx, Arc::clone(&plugin))?;
 
     let p = Arc::clone(&plugin);
@@ -2252,6 +2346,7 @@ mod tests {
                         "session_id": req.session_id,
                         "plugin": req.plugin,
                     })),
+                    InputRequest::Submit(_) => Ok(serde_json::json!(true)),
                 };
                 let _ = reply_tx.send(reply);
             }
@@ -2366,7 +2461,8 @@ mod tests {
     /// Each of these would otherwise go quietly wrong. A table read as a list
     /// keeps only its list part, so a single edit in place of `edits` reads
     /// as none, and a single mark in place of `marks` wipes `ns`. A misspelled
-    /// option drops what it asks for, like `strict`.
+    /// option drops what it asks for, like `strict`. A `text` to send reads
+    /// as "send this", while what goes out is the text on screen.
     #[test_case(decorate_script(r#"ns = "a", marks = {}, strict = true"#), UNKNOWN_FIELD_ERR ; "decorate_an_option_it_does_not_take")]
     #[test_case(decorate_script(r#"ns = "a", marks = { start = 0, stop = 1 }"#), NOT_A_LIST_ERR ; "decorate_a_single_mark_in_place_of_the_list")]
     #[test_case(decorate_script(r#"ns = "a", marks = { { stop = 1 } }"#), REQUIRED_ERR ; "decorate_a_mark_without_start")]
@@ -2380,41 +2476,19 @@ mod tests {
     #[test_case(edit_script(r#"edits = { { start = 0, stop = 0, text = "a" } }, text = "b""#), MIXED_EDIT_SHAPES_ERR ; "edit_an_edits_list_next_to_a_single_edit")]
     #[test_case(edit_script(r#"start = 0, stop = 0, text = "x", strcit = true"#), UNKNOWN_FIELD_ERR ; "edit_a_misspelled_option")]
     #[test_case(edit_script(r#"edits = { { start = 0, stop = 0, text = "x", cursor = 1 } }"#), UNKNOWN_FIELD_ERR ; "edit_an_option_inside_an_edit")]
+    #[test_case(r#"return ui.input_submit({ version = 7, session_id = "s", text = "hi" })"#.to_owned(), UNKNOWN_FIELD_ERR ; "submit_a_text_to_send")]
     fn input_calls_throw_on(script: String, expected: &str) {
         let lua = ui_with_input(echo_edit);
         let err = eval_err(&lua, &script);
         assert!(err.contains(expected), "{err}");
     }
 
-    /// Marks without a namespace have nowhere to go, and a namespace alone
-    /// would quietly wipe it.
-    #[test_case(r#"marks = {}"# ; "marks_without_ns")]
-    #[test_case(r#"ns = "a""# ; "ns_without_marks")]
-    fn input_edit_takes_marks_and_ns_together(fields: &str) {
-        let lua = ui_with_input(echo_edit);
-        let err = eval_err(
-            &lua,
-            &edit_script(&format!(r#"start = 0, stop = 0, text = "x", {fields}"#)),
-        );
-        assert!(err.contains(MARKS_HALVES_ERR), "{err}");
-    }
-
-    #[test]
-    fn input_decorate_without_a_ui_answers_the_error_slot() {
-        let lua = Lua::new();
+    #[test_case(r#"ui.input_decorate({ ns = "a", marks = {}, version = 0, session_id = "s" })"# ; "input_decorate")]
+    #[test_case(r#"ui.input_submit({ version = 0, session_id = "s" })"# ; "input_submit")]
+    fn without_a_ui_answers_the_error_slot(call: &str) {
+        let lua = lua_with_ui(None);
         mark_loaded(&lua, INPUT_PLUGIN);
-        let t = create_ui_table(
-            &lua,
-            None,
-            Arc::from(INPUT_PLUGIN),
-            PluginReach::new(PluginPermissions::trusted()),
-        )
-        .unwrap();
-        lua.globals().set("ui", t).unwrap();
-        let (val, err) = eval(
-            &lua,
-            r#"return ui.input_decorate({ ns = "a", marks = {}, version = 0, session_id = "s" })"#,
-        );
+        let (val, err) = eval(&lua, &format!("return {call}"));
         assert_eq!(val, serde_json::Value::Null);
         assert_eq!(err.as_deref(), Some(NO_UI_ERR));
     }
