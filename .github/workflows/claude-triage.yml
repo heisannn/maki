@@ -12,7 +12,9 @@ on:
 
 jobs:
   triage:
-    if: github.event_name == 'workflow_dispatch' || github.event.issue.labels[0] == null
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.issue.labels[0] == null && github.event.issue.user.type != 'Bot')
     runs-on: ubuntu-latest
     permissions:
       contents: read

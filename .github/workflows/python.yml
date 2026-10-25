@@ -13,7 +13,9 @@ on:
       - ".github/workflows/python.yml"
 
 env:
+  # renovate: datasource=pypi depName=ruff
   RUFF_VERSION: 0.16.2
+  # renovate: datasource=pypi depName=ty
   TY_VERSION: 0.0.70
 
 jobs:

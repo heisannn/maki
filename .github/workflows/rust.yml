@@ -48,6 +48,7 @@ jobs:
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     env:
+      # renovate: datasource=github-releases depName=JohnnyMorganz/StyLua
       STYLUA_VERSION: v2.4.1
     steps:
       - uses: actions/checkout@v7
@@ -66,6 +67,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       # Definition files in `lute check` (luau-lang/lute#1234) are not in a release yet.
+      # renovate: datasource=github-releases depName=luau-lang/lute versioning=semver
       LUTE_VERSION: v1.0.1-nightly.20261007
     steps:
       - uses: actions/checkout@v7

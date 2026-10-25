@@ -48,13 +48,16 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Build in Alpine container
+        env:
+          # renovate: datasource=docker depName=alpine
+          ALPINE_VERSION: "3.21"
         run: |
           docker run --rm \
             -v "${{ github.workspace }}:/workspace" \
             -w /workspace \
             -e CARGO_TERM_COLOR=always \
             -e CARGO_INCREMENTAL=0 \
-            alpine:3.21 sh -c '
+            "alpine:${ALPINE_VERSION}" sh -c '
               apk add --no-cache gcc g++ musl-dev make linux-headers curl git ca-certificates pkgconf python3-dev
               git config --global --add safe.directory /workspace
               curl --proto "=https" --tlsv1.2 --retry 5 --retry-delay 2 --retry-all-errors -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --target ${{ matrix.target }}
@@ -102,6 +105,7 @@ jobs:
       # no gcc-*-netbsd packages and NetBSD ships no cross kits for Linux.
       - name: Install zig
         env:
+          # renovate: datasource=forgejo-tags depName=ziglang/zig registryUrl=https://codeberg.org
           ZIG_VERSION: 0.16.0
         run: |
           .github/scripts/retry.sh curl -sSfL -o "$RUNNER_TEMP/zig.tar.xz" "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
