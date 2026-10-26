@@ -229,6 +229,13 @@ impl StatusBar {
 
         let mut right_spans = Vec::new();
 
+        // A flash answers what the user just did, while the path and the
+        // model sit there all day. So they shrink to make room for it.
+        let flash_span = self
+            .flash
+            .as_ref()
+            .map(|(msg, _)| Span::styled(format!(" {msg}"), theme::current().status_notice));
+
         // An error takes the whole bar over. The label saying the agent
         // approves everything has to survive that, so it is built out here
         // and both arms place it.
@@ -304,6 +311,7 @@ impl StatusBar {
                 let reserved = left_spans
                     .iter()
                     .chain(rest_spans.iter())
+                    .chain(flash_span.iter())
                     .map(Span::width)
                     .sum::<usize>()
                     + CWD_MODEL_SEPARATOR.width();
@@ -318,12 +326,7 @@ impl StatusBar {
             }
         }
 
-        if let Some((ref msg, _)) = self.flash {
-            left_spans.push(Span::styled(
-                format!(" {msg}"),
-                theme::current().status_notice,
-            ));
-        }
+        left_spans.extend(flash_span);
 
         let [left_area, right_area] = Layout::horizontal([
             Constraint::Min(0),
@@ -453,6 +456,9 @@ mod tests {
     const EXPECT_TICKING: &str = "a waiting message has to claim the frames that advance it";
     const EXPECT_NEWEST: &str = "a flash answers the user's last action, not an earlier one";
     const STALE_BRANCH: &str = "/nowhere:gone";
+    const LONG_CWD: &str = "~/projects/a/rather/deep/folder/for/this/repository:feature/branch";
+    const LONG_FLASH: &str =
+        "a plugin wrote part of this shell line: retype it yourself in a fresh input";
     const BAR_WIDTH: u16 = 120;
     const MODEL_ID: &str = "test-model";
     const CONTEXT_SIZE: u32 = 12_000;
@@ -481,7 +487,10 @@ mod tests {
     }
 
     fn draw(ctx: &StatusBarContext<'_>) -> String {
-        let bar = StatusBar::new(FLASH_TTL);
+        draw_bar(&StatusBar::new(FLASH_TTL), ctx)
+    }
+
+    fn draw_bar(bar: &StatusBar, ctx: &StatusBarContext<'_>) -> String {
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(BAR_WIDTH, 1)).unwrap();
         terminal.draw(|f| bar.view(f, f.area(), ctx)).unwrap();
@@ -560,6 +569,19 @@ mod tests {
     #[test_case(false => false ; "a_prompting_session_stays_quiet")]
     fn the_bar_advertises_yolo(yolo: bool) -> bool {
         render(None, false, yolo).contains(YOLO_LABEL.trim())
+    }
+
+    /// The path and the model are there all day, so a message answering
+    /// what the user just did is read in full before them.
+    #[test]
+    fn a_flash_pushes_the_path_and_model_aside() {
+        let mut bar = StatusBar::new(FLASH_TTL);
+        bar.cwd_branch = LONG_CWD.into();
+        bar.flash(LONG_FLASH.into());
+
+        let text = draw_bar(&bar, &context(&Status::Idle, None, false, false));
+
+        assert!(text.contains(LONG_FLASH), "{text}");
     }
 
     #[test]
