@@ -3541,13 +3541,27 @@ Requires the `run` [plugin permission](#plugin-permissions).
   - `tools` (`table?`) map of `name -> function` for tools the sandbox may call.
     Each function receives the tool input table and must return `(string)` or
     `(nil, err)`. Tool calls are batched and dispatched concurrently.
-  - `files` (`table?`) serves text file access from `open()` and `pathlib`.
-    `read(path)` returns `(content)`, `write(path, content, append)` returns
-    `(string)`, and both return `(nil, err)` on failure. Leave one out to
-    refuse that access. Writes wait and go out as one `write` per file right
-    before a tool call, a read of that path, or the end of the run, and a
-    cancelled run drops the ones still waiting. A failed write ends the run,
-    unless a read sent it, then it raises `OSError` just like a failed read.
+  - `files` (`table?`) serves `open()`, `os` and `pathlib`. Without it, any
+    OS call ends the run. Each callback returns `(nil, err)` to refuse, and
+    leaving one out refuses that access. `os.getenv` only sees a few
+    harmless variables such as `HOME` and `PATH`. Sleeps and metadata
+    queries, time in `inspect` included, share a budget of `timeout`
+    seconds, and going over ends the run like the timeout does.
+    - `read(path)` returns `(content)`.
+    - `write(path, content, append)` returns `(string)` or `(true)`. Writes
+    are held back and sent as one `write` per file right before a tool
+    call, a read, a metadata query or the end of the run. A cancelled run
+    drops them. A failed write ends the run, unless a read of that file
+    sent it, then the read raises `OSError`.
+    - `inspect(path)` returns `(true)` to let the script look at {path} and
+    everything under it with `os.stat`, `os.walk`, `Path.glob` and the
+    like. {path} is absolute, exactly as Maki will read it. Maki reads
+    the disk itself, so this needs the `fs_read` permission. A refusal
+    raises `RuntimeError`, because `os.walk` and `os.path.exists` would
+    swallow an `OSError`.
+    - `mkdir(path, parents)` returns `(true)` once the directory exists.
+    Maki handles `exist_ok` itself, so the absolute {path} must pass
+    `inspect` first, and `mkdir` only sees missing paths.
 
 **Returns:** (`table`, `string?`) Result table, plus an error string on failure.
 

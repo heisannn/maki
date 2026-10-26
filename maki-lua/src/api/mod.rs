@@ -152,7 +152,11 @@ pub(crate) fn create_maki_global(
     )?;
     maki.set(
         "interpreter",
-        interpreter::create_interpreter_table(lua, permissions)?,
+        interpreter::create_interpreter_table(
+            lua,
+            permissions,
+            permissions.is_allowed(Permission::FsRead),
+        )?,
     )?;
     maki.set(
         "agent",

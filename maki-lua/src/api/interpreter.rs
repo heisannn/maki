@@ -13,12 +13,14 @@ use maki_interpreter::error::InterpreterError;
 use maki_interpreter::runner::{self, FileFn, FileOp, ToolFn};
 use maki_interpreter::{AsyncResolver, PendingCall};
 use maki_lua_macro::{lua_fn, lua_table};
-use mlua::{Function, IntoLuaMulti, Lua, Result as LuaResult, Table};
+use mlua::{
+    Function, IntoLuaMulti, Lua, MultiValue, Result as LuaResult, Table, Value as LuaValue,
+};
 use serde_json::Value;
 
 use crate::api::util::convert::{TableExt, json_to_lua, lua_tool_result};
 use crate::api::util::pair::Pair;
-use crate::plugin_permissions::PluginPermissions;
+use crate::plugin_permissions::{Permission, PluginPermissions, denied_error};
 use crate::runtime::{TaskHandle, lock_cell};
 
 const BRIDGE_CLOSED: &str = "tool bridge closed (cancelled)";
@@ -53,15 +55,25 @@ fn forward_calls(
         .map_err(|_| InterpreterError::Runtime(BRIDGE_CLOSED.into()))
 }
 
-async fn call_lua_file_fn(f: Option<&Function>, args: impl IntoLuaMulti) -> FileResult {
+async fn call_lua_file_fn(
+    f: Option<&Function>,
+    args: impl IntoLuaMulti,
+) -> Result<MultiValue, String> {
     let Some(f) = f else {
         return Err(FILE_OP_DENIED.to_owned());
     };
-    let values = f
-        .call_async::<mlua::MultiValue>(args)
+    f.call_async::<MultiValue>(args)
         .await
-        .map_err(|e| e.to_string())?;
-    lua_tool_result(values)
+        .map_err(|e| e.to_string())
+}
+
+/// Every callback but `read` may answer `(true)` or pass on what a tool call
+/// returned. `read` must give content, or `(true)` would pass for an empty file.
+fn file_ack(values: MultiValue) -> FileResult {
+    match values.front() {
+        Some(LuaValue::Boolean(true)) => Ok(String::new()),
+        _ => lua_tool_result(values).map(|_| String::new()),
+    }
 }
 
 async fn call_lua_tool(lua: Lua, f: Option<Function>, pc: &PendingCall) -> Result<Value, String> {
@@ -71,7 +83,7 @@ async fn call_lua_tool(lua: Lua, f: Option<Function>, pc: &PendingCall) -> Resul
     let input = build_tool_input(&pc.args, &pc.kwargs)?;
     let arg = json_to_lua(&lua, &input).map_err(|e| e.to_string())?;
     let values = f
-        .call_async::<mlua::MultiValue>(arg)
+        .call_async::<MultiValue>(arg)
         .await
         .map_err(|e| e.to_string())?;
     lua_tool_result(values).map(Value::String)
@@ -98,13 +110,27 @@ async fn call_lua_tool(lua: Lua, f: Option<Function>, pc: &PendingCall) -> Resul
 ///   `tools` (table?) - map of `name -> function` for tools the sandbox may call.
 ///     Each function receives the tool input table and must return `(string)` or
 ///     `(nil, err)`. Tool calls are batched and dispatched concurrently.
-///   `files` (table?) - serves text file access from `open()` and `pathlib`.
-///     `read(path)` returns `(content)`, `write(path, content, append)` returns
-///     `(string)`, and both return `(nil, err)` on failure. Leave one out to
-///     refuse that access. Writes wait and go out as one `write` per file right
-///     before a tool call, a read of that path, or the end of the run, and a
-///     cancelled run drops the ones still waiting. A failed write ends the run,
-///     unless a read sent it, then it raises `OSError` just like a failed read.
+///   `files` (table?) - serves `open()`, `os` and `pathlib`. Without it, any
+///     OS call ends the run. Each callback returns `(nil, err)` to refuse, and
+///     leaving one out refuses that access. `os.getenv` only sees a few
+///     harmless variables such as `HOME` and `PATH`. Sleeps and metadata
+///     queries, time in `inspect` included, share a budget of `timeout`
+///     seconds, and going over ends the run like the timeout does.
+///     - `read(path)` returns `(content)`.
+///     - `write(path, content, append)` returns `(string)` or `(true)`. Writes
+///       are held back and sent as one `write` per file right before a tool
+///       call, a read, a metadata query or the end of the run. A cancelled run
+///       drops them. A failed write ends the run, unless a read of that file
+///       sent it, then the read raises `OSError`.
+///     - `inspect(path)` returns `(true)` to let the script look at {path} and
+///       everything under it with `os.stat`, `os.walk`, `Path.glob` and the
+///       like. {path} is absolute, exactly as Maki will read it. Maki reads
+///       the disk itself, so this needs the `fs_read` permission. A refusal
+///       raises `RuntimeError`, because `os.walk` and `os.path.exists` would
+///       swallow an `OSError`.
+///     - `mkdir(path, parents)` returns `(true)` once the directory exists.
+///       Maki handles `exist_ok` itself, so the absolute {path} must pass
+///       `inspect` first, and `mkdir` only sees missing paths.
 /// @return (table, string?) Result table, plus an error string on failure.
 /// @example
 /// local result, err = maki.interpreter.run("print(2 + 2)", {
@@ -115,17 +141,28 @@ async fn call_lua_tool(lua: Lua, f: Option<Function>, pc: &PendingCall) -> Resul
 /// if err then error(err) end
 /// if result.stdout then print(result.stdout) end
 #[lua_fn(guard = Run, name = "run")]
-async fn interpreter_run(lua: Lua, code: String, opts: Table) -> LuaResult<Pair<Table>> {
+async fn interpreter_run(
+    lua: Lua,
+    #[ctx] fs_read: bool,
+    code: String,
+    opts: Table,
+) -> LuaResult<Pair<Table>> {
     let timeout_secs: u64 = required(&opts, "timeout")?;
     let max_memory_mb: usize = required(&opts, "max_memory_mb")?;
     let on_output: Function = required(&opts, "on_output")?;
     let preamble: String = opts.opt::<String>("preamble")?.unwrap_or_default();
     let tools_tbl: Option<Table> = opts.opt("tools")?;
-    let (read_fn, write_fn): (Option<Function>, Option<Function>) =
-        match opts.opt::<Table>("files")? {
-            Some(t) => (t.opt("read")?, t.opt("write")?),
-            None => (None, None),
-        };
+    let files_tbl: Option<Table> = opts.opt("files")?;
+    let file_fn = |name: &str| -> LuaResult<Option<Function>> {
+        files_tbl.as_ref().map_or(Ok(None), |t| t.opt(name))
+    };
+    let read_fn = file_fn("read")?;
+    let write_fn = file_fn("write")?;
+    let inspect_fn = file_fn("inspect")?;
+    let mkdir_fn = file_fn("mkdir")?;
+    if inspect_fn.is_some() && !fs_read {
+        return Err(denied_error(Permission::FsRead));
+    }
 
     let mut fns: HashMap<String, Function> = HashMap::new();
     if let Some(t) = tools_tbl {
@@ -232,9 +269,21 @@ async fn interpreter_run(lua: Lua, code: String, opts: Table) -> LuaResult<Pair<
                 }
                 BridgeMsg::File(op, reply) => {
                     let result = match op {
-                        FileOp::Read(path) => call_lua_file_fn(read_fn.as_ref(), path).await,
+                        FileOp::Read(path) => call_lua_file_fn(read_fn.as_ref(), path)
+                            .await
+                            .and_then(lua_tool_result),
                         FileOp::Write(w) => {
-                            call_lua_file_fn(write_fn.as_ref(), (w.path, w.content, w.append)).await
+                            call_lua_file_fn(write_fn.as_ref(), (w.path, w.content, w.append))
+                                .await
+                                .and_then(file_ack)
+                        }
+                        FileOp::Inspect(path) => call_lua_file_fn(inspect_fn.as_ref(), path)
+                            .await
+                            .and_then(file_ack),
+                        FileOp::Mkdir(dir) => {
+                            call_lua_file_fn(mkdir_fn.as_ref(), (dir.path, dir.parents))
+                                .await
+                                .and_then(file_ack)
                         }
                     };
                     let _ = reply.send(result);
@@ -280,7 +329,10 @@ lua_table! {
     ///   on_output = function(line) print(line) end,
     /// })
     /// ```
-    "maki.interpreter" => pub(crate) fn create_interpreter_table(perms: &PluginPermissions), DOCS [
-        interpreter_run(perms),
+    "maki.interpreter" => pub(crate) fn create_interpreter_table(
+        perms: &PluginPermissions,
+        fs_read: bool,
+    ), DOCS [
+        interpreter_run(perms, fs_read),
     ]
 }

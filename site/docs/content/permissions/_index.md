@@ -76,6 +76,8 @@ Tools that never declare permission scopes (for example `read`, `glob`, `grep`, 
 
 Container tools like `batch` and `code_execution` prompt for each inner tool individually.
 
+Inside `code_execution`, `open()` goes through the `read` and `write` tools, so their rules apply. Metadata and listings (`os.stat`, `os.walk`, `Path.glob`) work only while the `list` tool is enabled and no plugin hooks it. A script can create a directory only where `write` would run without a prompt, since there is no tool call to prompt on, and only while `list` works too. Removing and renaming files is left to `bash`.
+
 ## TOML Configuration
 
 There are two permission files:
