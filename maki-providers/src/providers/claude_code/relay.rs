@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 use smol::net::{TcpListener, TcpStream};
 use tracing::debug;
 
-use crate::providers::anthropic::shared::EventParser;
+use crate::providers::anthropic::shared::{self, EventParser};
 use crate::providers::{Timeouts, http_client, next_sse_line};
 use crate::{AgentError, ContentBlock, ProviderEvent, StreamResponse};
 
@@ -327,22 +327,8 @@ fn overlay_request(mut native: Value, body: &Value) -> Result<Value, AgentError>
             last.insert("cache_control".to_owned(), cache_control.clone());
         }
     }
-    let tools = native["tools"].as_array_mut().into_iter().flatten();
-    retag_breakpoints(tools, &cache_control);
-    let blocks = native["messages"]
-        .as_array_mut()
-        .into_iter()
-        .flatten()
-        .filter_map(|message| message["content"].as_array_mut())
-        .flatten();
-    retag_breakpoints(blocks, &cache_control);
+    shared::retag_breakpoints(&mut native, &cache_control);
     Ok(native)
-}
-
-fn retag_breakpoints<'a>(items: impl Iterator<Item = &'a mut Value>, cache_control: &Value) {
-    for existing in items.filter_map(|item| item.get_mut("cache_control")) {
-        *existing = cache_control.clone();
-    }
 }
 
 async fn read_request(

@@ -107,6 +107,7 @@ const CHAT_COMPLETIONS_PATH: &str = "/chat/completions";
 const RESPONSES_PATH: &str = "/responses";
 const MESSAGES_PATH: &str = "/v1/messages";
 const MODELS_PATH: &str = "/models";
+const CACHE_TTL: &str = "1h";
 
 /// Scales `/models` AI-credit prices (1 credit = $0.01) to USD per 1M tokens.
 const AIC_TO_USD_PER_MILLION: f64 = 10_000.0;
@@ -750,6 +751,7 @@ fn messages_body(
     }];
     let mut body =
         shared::build_request_body_with_system(model, messages, &system, tools, thinking, None);
+    shared::retag_breakpoints(&mut body, &json!({"type": "ephemeral", "ttl": CACHE_TTL}));
     body["model"] = json!(model.id);
     body["stream"] = json!(true);
     body
@@ -1168,7 +1170,7 @@ mod tests {
 
         assert_eq!(
             body["messages"],
-            json!([{"role": "assistant", "content": [{"type": "text", "text": REPLY, "cache_control": {"type": "ephemeral"}}]}])
+            json!([{"role": "assistant", "content": [{"type": "text", "text": REPLY, "cache_control": {"type": "ephemeral", "ttl": CACHE_TTL}}]}])
         );
     }
 
@@ -1193,11 +1195,11 @@ mod tests {
 
         assert_eq!(
             body["system"][0]["cache_control"],
-            json!({"type": "ephemeral"})
+            json!({"type": "ephemeral", "ttl": CACHE_TTL})
         );
         assert_eq!(
             body["tools"][0]["cache_control"],
-            json!({"type": "ephemeral"})
+            json!({"type": "ephemeral", "ttl": CACHE_TTL})
         );
         assert!(
             body["messages"][0]["content"][0]
@@ -1206,11 +1208,11 @@ mod tests {
         );
         assert_eq!(
             body["messages"][1]["content"][0]["cache_control"],
-            json!({"type": "ephemeral"})
+            json!({"type": "ephemeral", "ttl": CACHE_TTL})
         );
         assert_eq!(
             body["messages"][2]["content"][0]["cache_control"],
-            json!({"type": "ephemeral"})
+            json!({"type": "ephemeral", "ttl": CACHE_TTL})
         );
     }
 

@@ -371,6 +371,29 @@ pub(super) fn build_wire_tools(tools: &Value) -> Value {
     Value::Array(out)
 }
 
+/// Retags every breakpoint already placed in `body`. The API rejects a longer
+/// TTL after a shorter one, so a TTL must apply to all of them at once.
+pub(crate) fn retag_breakpoints(body: &mut Value, cache_control: &Value) {
+    for key in ["system", "tools"] {
+        let blocks = body.get_mut(key).and_then(Value::as_array_mut);
+        retag_blocks(blocks.into_iter().flatten(), cache_control);
+    }
+    let blocks = body
+        .get_mut("messages")
+        .and_then(Value::as_array_mut)
+        .into_iter()
+        .flatten()
+        .filter_map(|message| message.get_mut("content").and_then(Value::as_array_mut))
+        .flatten();
+    retag_blocks(blocks, cache_control);
+}
+
+fn retag_blocks<'a>(blocks: impl Iterator<Item = &'a mut Value>, cache_control: &Value) {
+    for existing in blocks.filter_map(|block| block.get_mut("cache_control")) {
+        *existing = cache_control.clone();
+    }
+}
+
 pub(crate) fn has_deferred_tools(tools: &Value) -> bool {
     tools
         .as_array()
