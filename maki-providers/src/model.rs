@@ -760,24 +760,34 @@ impl Model {
         let max = self
             .max_thinking_budget()
             .unwrap_or(FALLBACK_MAX_THINKING_BUDGET);
-        (!self.requires_thinking())
+        let ladder = self.effort_ladder();
+        let free_form = ladder.is_none();
+        (free_form && !self.requires_thinking())
             .then_some(THINKING_OFF)
             .into_iter()
             .chain(
-                (ThinkingConfig::Adaptive.shown(self) == ThinkingConfig::Adaptive)
+                (free_form && ThinkingConfig::Adaptive.shown(self) == ThinkingConfig::Adaptive)
                     .then_some(THINKING_ADAPTIVE),
             )
             .map(|name| ThinkingOption { name, tokens: None })
             .chain(
-                Effort::ALL
-                    .into_iter()
-                    .filter(|level| declared.is_none_or(|fields| fields.levels.contains_key(level)))
+                ladder
+                    .unwrap_or(&Effort::ALL)
+                    .iter()
+                    .filter(|level| {
+                        declared.is_none_or(|fields| fields.levels.contains_key(*level))
+                    })
                     .map(|level| ThinkingOption {
                         name: level.as_str(),
                         tokens: declared.is_none().then(|| level.budget(max)),
                     }),
             )
             .collect()
+    }
+
+    /// The only effort levels this model takes, where its provider fixes them.
+    pub fn effort_ladder(&self) -> Option<&'static [Effort]> {
+        ProviderRegistry::for_slug(&self.provider)?.effort_ladder
     }
 
     /// This model carrying one request's output budget, leaving the declared

@@ -18,7 +18,7 @@ use crate::{
 pub(super) const BETA_TOOL_EXAMPLES_BEDROCK: &str = "tool-examples-2025-10-29";
 /// Unlocks `defer_loading` and `tool_reference` expansion. The direct API
 /// no longer requires it, but gateways that pin an older surface still do.
-pub(super) const BETA_DEFERRED_TOOLS: &str = "advanced-tool-use-2025-11-20";
+pub(crate) const BETA_DEFERRED_TOOLS: &str = "advanced-tool-use-2025-11-20";
 pub(super) const BETA_DEFERRED_TOOLS_BEDROCK: &str = "tool-search-tool-2025-10-19";
 
 /// The messages API refuses requests without max_tokens. Anthropic-kind
@@ -371,7 +371,7 @@ pub(super) fn build_wire_tools(tools: &Value) -> Value {
     Value::Array(out)
 }
 
-pub(super) fn has_deferred_tools(tools: &Value) -> bool {
+pub(crate) fn has_deferred_tools(tools: &Value) -> bool {
     tools
         .as_array()
         .is_some_and(|arr| arr.iter().any(is_deferred_tool))
@@ -405,7 +405,7 @@ pub(crate) fn build_request_body_with_system(
     body
 }
 
-pub(super) struct EventParser {
+pub(crate) struct EventParser {
     content_blocks: Vec<ContentBlock>,
     current_tool_json: String,
     current_block_idx: usize,

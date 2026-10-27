@@ -4,7 +4,7 @@ use std::sync::LazyLock;
 use serde::Deserialize;
 
 use crate::model::{ModelEntry, ModelFamily, ModelPricing, ModelTier};
-use crate::spec::{NO_CURATED_MODELS, ProviderRegistry};
+use crate::spec::{Build, Local, NO_CURATED_MODELS, ProviderRegistry, ProviderSpec};
 
 const SLUG_MISMATCH: &str = "slug header";
 const NO_PREFIXES: &str = "no prefixes";
@@ -64,19 +64,53 @@ impl From<CuratedRow> for ModelEntry {
 /// by slug rather than by spec identity because a `ProviderSpec` is a `const`
 /// that call sites copy, so there is no single address to key on.
 static TABLES: LazyLock<HashMap<&'static str, Box<[ModelEntry]>>> = LazyLock::new(|| {
-    ProviderRegistry::all_compiled()
+    let specs = ProviderRegistry::all_compiled();
+    specs
         .iter()
         .map(|spec| {
             // Const fields only. Calling `ProviderSpec::models()` here would
             // re-enter this `LazyLock` and hang.
-            let table = match spec.models_toml {
-                NO_CURATED_MODELS => Box::default(),
-                src => parse(spec.slug, src).unwrap_or_else(|e| panic!("{e}")),
+            let table = match spec.build {
+                Build::Local(local) => lent_table(specs, local),
+                _ => parsed_table(spec),
             };
             (spec.slug, table)
         })
         .collect()
 });
+
+fn parsed_table(spec: &ProviderSpec) -> Box<[ModelEntry]> {
+    match spec.models_toml {
+        NO_CURATED_MODELS => Box::default(),
+        src => parse(spec.slug, src).unwrap_or_else(|e| panic!("{e}")),
+    }
+}
+
+/// The lender's rows for the ids the local transport serves, in its order. The
+/// lender's defaults may be rows left out here, so the first row of each tier
+/// becomes that tier's default instead.
+fn lent_table(specs: &[ProviderSpec], local: Local) -> Box<[ModelEntry]> {
+    let lender = specs
+        .iter()
+        .find(|spec| spec.slug == local.models_from)
+        .unwrap_or_else(|| panic!("{} lends no model table", local.models_from));
+    let mut rows = parsed_table(lender).into_vec();
+    let mut tiers = Vec::new();
+    local
+        .models
+        .iter()
+        .map(|id| {
+            let index = rows
+                .iter()
+                .position(|entry| entry.prefixes[0] == *id)
+                .unwrap_or_else(|| panic!("models/{}.toml has no {id}", local.models_from));
+            let mut entry = rows.swap_remove(index);
+            entry.default = !tiers.contains(&entry.tier);
+            tiers.push(entry.tier);
+            entry
+        })
+        .collect()
+}
 
 /// Empty for any slug that is not a builtin, which is the right answer: those
 /// providers hand out their models from a live catalog.

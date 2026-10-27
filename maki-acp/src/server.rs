@@ -4,26 +4,29 @@ use std::iter;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use agent_client_protocol_schema::v1::{
-    AgentNotification, AgentRequest, AgentResponse, ConfigOptionUpdate, ContentBlock,
-    CurrentModeUpdate, EmbeddedResourceResource, Error as AcpError, ImageContent,
+    AgentNotification, AgentRequest, AgentResponse, AvailableCommandsUpdate, ConfigOptionUpdate,
+    ContentBlock, CurrentModeUpdate, EmbeddedResourceResource, Error as AcpError, ImageContent,
     InitializeRequest, JsonRpcMessage, ListSessionsRequest, ListSessionsResponse,
     LoadSessionRequest, McpServer, NewSessionRequest, Notification, PromptRequest, PromptResponse,
     Request, RequestId, RequestPermissionRequest, RequestPermissionResponse, Response,
-    SessionConfigOptionValue, SessionId, SessionInfo, SessionModeId, SessionNotification,
-    SessionUpdate, SetSessionConfigOptionRequest, SetSessionConfigOptionResponse,
-    SetSessionModeRequest, SetSessionModeResponse, StopReason, TextContent,
+    SessionConfigOption, SessionConfigOptionValue, SessionId, SessionInfo, SessionModeId,
+    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
+    SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse, StopReason,
+    TextContent,
 };
 use color_eyre::eyre::Context;
 use flume::{Sender, WeakSender};
-use maki_agent::headless::{self, InteractiveHandle, InteractiveParams};
+use maki_agent::command::{CustomCommand, discover_commands};
+use maki_agent::headless::{self, InteractiveHandle, InteractiveInput, InteractiveParams};
 use maki_agent::mcp::config::{RawHttpFields, RawStdioFields, RawTransport};
 use maki_agent::mcp::{self, McpHandle};
 use maki_agent::permissions::{PermissionAnswer, TaggedAnswer};
 use maki_agent::session::{Resumed, StoredSession};
 use maki_agent::tools::{LocalTool, LocalTools, QUESTION_TOOL_NAME, ToolAudience, local_tool};
-use maki_agent::types::AgentEvent;
+use maki_agent::types::{AgentEvent, BufferSnapshot, SharedBuf};
 use maki_agent::{
     AgentInput, AgentMode, Envelope, ImageMediaType, ImageSource, InputSource, SessionEndReason,
     SessionEvents,
@@ -35,13 +38,14 @@ use maki_providers::provider::{available_model_specs, fetch_all_models};
 use maki_providers::{add_cost, settle_session};
 use maki_storage::StateDir;
 use maki_storage::id::{MakiId, SessionRef};
-use maki_storage::sessions::{SessionClaim, SessionError};
+use maki_storage::sessions::{SessionClaim, SessionError, StoredThinking};
 use serde::Serialize;
 use serde_json::Value;
-use smol::Task;
 use smol::io::AsyncBufReadExt;
+use smol::{Task, Timer, future};
 use tracing::{debug, info, warn};
 
+use crate::commands::{self, Command};
 use crate::{AcpParams, SessionEndHook, elicitation, methods, permissions, translate};
 
 const FIRST_OUTGOING_REQUEST_ID: i64 = 1000;
@@ -53,6 +57,7 @@ const RESTORED_FAST: bool = false;
 /// is not an internal error (`-32603`), nothing broke here, and the message
 /// already says which session and why.
 const SESSION_BUSY_CODE: i32 = -32000;
+const LIVE_OUTPUT_POLL: Duration = Duration::from_millis(200);
 
 /// Ids come from here and are never reused, so a late answer for a closed
 /// session cannot match a request of the session that replaced it.
@@ -86,10 +91,12 @@ struct SessionState {
     mcp: Option<McpHandle>,
     current_mode: AgentMode,
     current_model: String,
+    thinking: StoredThinking,
     pending: PendingState,
     /// Shared with the run, so reloading the same session reads under this
     /// claim instead of clashing with it.
     claim: SessionClaim,
+    custom_commands: Vec<CustomCommand>,
 }
 
 struct Server {
@@ -207,11 +214,12 @@ fn refresh_models(srv: &mut Server, batch: Vec<String>) {
     }
     // Merged even with no session yet, since session/new builds its selector from this list.
     let Some(session) = &srv.session else { return };
-    let option = methods::model_config_option(&session.current_model, &srv.model_specs);
+    let options =
+        methods::config_options(&session.current_model, &srv.model_specs, session.thinking);
     session_update(
         &srv.out_tx,
         &SessionId::from(session.handle.session_id.to_string()),
-        SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(vec![option])),
+        SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(options)),
     );
 }
 
@@ -274,7 +282,24 @@ async fn handle_request(
         "session/set_config_option" => handle_set_config(srv, raw),
         _ => Err(AcpError::method_not_found()),
     };
+    // Sent after the response, so the client already knows the session id the
+    // update names.
+    let started = result.is_ok() && matches!(method, "session/new" | "session/load");
     srv.respond(id, result);
+    if started {
+        announce_commands(srv);
+    }
+}
+
+fn announce_commands(srv: &Server) {
+    let Some(session) = &srv.session else { return };
+    session_update(
+        &srv.out_tx,
+        &SessionId::from(session.handle.session_id.to_string()),
+        SessionUpdate::AvailableCommandsUpdate(AvailableCommandsUpdate::new(commands::available(
+            &session.custom_commands,
+        ))),
+    );
 }
 
 async fn new_session(
@@ -303,9 +328,8 @@ async fn new_session(
         None,
     );
     maki_otel::emit::session_started(maki_otel::emit::START_FRESH, Some(session_ref.as_str()));
-    let spec = params.model.spec();
     let resp = methods::new_session_response(session_ref.as_str())
-        .config_options(vec![methods::model_config_option(&spec, &srv.model_specs)]);
+        .config_options(current_config_options(srv));
     Ok(AgentResponse::NewSessionResponse(resp))
 }
 
@@ -380,9 +404,7 @@ async fn load_session(
         restored_cost,
     );
     maki_otel::emit::session_started(maki_otel::emit::START_RESUME, Some(started.as_str()));
-    let spec = params.model.spec();
-    let resp = methods::load_session_response()
-        .config_options(vec![methods::model_config_option(&spec, &srv.model_specs)]);
+    let resp = methods::load_session_response().config_options(current_config_options(srv));
     Ok(AgentResponse::LoadSessionResponse(resp))
 }
 
@@ -484,6 +506,7 @@ fn start_session(
         local_tools,
     });
     let session_ref = handle.session_id.clone();
+    let custom_commands = discover_commands(&cwd);
     start_event_pump(
         events,
         session_ref.clone(),
@@ -500,8 +523,10 @@ fn start_session(
         mcp,
         current_mode: AgentMode::Build,
         current_model: params.model.spec(),
+        thinking: srv.defaults.thinking.unwrap_or(StoredThinking::Off),
         pending,
         claim,
+        custom_commands,
     });
     session_ref
 }
@@ -744,13 +769,11 @@ fn handle_prompt(srv: &mut Server, raw: &Value, id: &RequestId) -> Result<(), Ac
     let session = srv.session.as_ref().ok_or_else(no_session)?;
 
     let (message, images) = extract_prompt_content(&req.prompt);
-    let input = AgentInput::from_defaults(
-        message,
-        session.current_mode.clone(),
-        images,
-        srv.defaults,
-        InputSource::Acp,
-    );
+    let input = match commands::parse(&message, &session.custom_commands) {
+        Some(Command::Compact(instructions)) => InteractiveInput::Compact(instructions),
+        Some(Command::Prompt(rendered)) => prompt_input(session, srv.defaults, rendered, images),
+        None => prompt_input(session, srv.defaults, message, images),
+    };
 
     // One outstanding id per session, checked and set under the same guard:
     // `input_tx` is unbounded, so a second prompt would queue happily and
@@ -766,6 +789,25 @@ fn handle_prompt(srv: &mut Server, raw: &Value, id: &RequestId) -> Result<(), Ac
         .map_err(|_| AcpError::new(-32603, "session ended"))?;
     pending.prompt = Some(id.clone());
     Ok(())
+}
+
+fn prompt_input(
+    session: &SessionState,
+    defaults: SessionDefaults,
+    message: String,
+    images: Vec<ImageSource>,
+) -> InteractiveInput {
+    let defaults = SessionDefaults {
+        thinking: Some(session.thinking),
+        ..defaults
+    };
+    InteractiveInput::Prompt(AgentInput::from_defaults(
+        message,
+        session.current_mode.clone(),
+        images,
+        defaults,
+        InputSource::Acp,
+    ))
 }
 
 fn handle_set_mode(srv: &mut Server, raw: &Value) -> Result<AgentResponse, AcpError> {
@@ -790,15 +832,24 @@ fn handle_set_mode(srv: &mut Server, raw: &Value) -> Result<AgentResponse, AcpEr
 
 fn handle_set_config(srv: &mut Server, raw: &Value) -> Result<AgentResponse, AcpError> {
     let req: SetSessionConfigOptionRequest = parse_params(raw)?;
-    if req.config_id.0.as_ref() != methods::MODEL_CONFIG_ID {
-        let detail = format!("unknown config option: {}", req.config_id);
-        return Err(AcpError::invalid_params().data(json_str(&detail)));
-    }
-
     let SessionConfigOptionValue::ValueId { value } = req.value else {
-        return Err(AcpError::invalid_params().data(json_str(&"model must be a value id")));
+        return Err(AcpError::invalid_params().data(json_str(&"config value must be a value id")));
     };
-    let spec = value.0.to_string();
+    let value = value.0.to_string();
+    match req.config_id.0.as_ref() {
+        methods::MODEL_CONFIG_ID => set_model(srv, value)?,
+        methods::THINKING_CONFIG_ID => set_thinking(srv, &value)?,
+        other => {
+            let detail = format!("unknown config option: {other}");
+            return Err(AcpError::invalid_params().data(json_str(&detail)));
+        }
+    }
+    Ok(AgentResponse::SetSessionConfigOptionResponse(
+        SetSessionConfigOptionResponse::new(current_config_options(srv)),
+    ))
+}
+
+fn set_model(srv: &mut Server, spec: String) -> Result<(), AcpError> {
     if !srv.model_policy.allows(&spec) {
         return Err(AcpError::invalid_params().data(json_str(&"model is not allowed by policy")));
     }
@@ -811,14 +862,24 @@ fn handle_set_config(srv: &mut Server, raw: &Value) -> Result<AgentResponse, Acp
         .model_tx
         .send(model)
         .map_err(|_| AcpError::new(-32603, "session ended"))?;
-    session.current_model = spec.clone();
+    session.current_model = spec;
+    Ok(())
+}
 
-    Ok(AgentResponse::SetSessionConfigOptionResponse(
-        SetSessionConfigOptionResponse::new(vec![methods::model_config_option(
-            &spec,
-            &srv.model_specs,
-        )]),
-    ))
+fn set_thinking(srv: &mut Server, value: &str) -> Result<(), AcpError> {
+    let thinking = StoredThinking::parse_setting(value)
+        .map_err(|e| AcpError::invalid_params().data(json_str(&e.to_string())))?;
+    srv.session.as_mut().ok_or_else(no_session)?.thinking = thinking;
+    Ok(())
+}
+
+fn current_config_options(srv: &Server) -> Vec<SessionConfigOption> {
+    match &srv.session {
+        Some(session) => {
+            methods::config_options(&session.current_model, &srv.model_specs, session.thinking)
+        }
+        None => Vec::new(),
+    }
 }
 
 fn handle_notification(srv: &Server, method: &str) {
@@ -948,10 +1009,11 @@ fn start_event_pump(
         // the tool call that asked for permission. Kept for the turn, like
         // sdk_mode does: the history holds these inputs anyway.
         let mut tool_inputs: HashMap<String, Value> = HashMap::new();
+        let mut live_bufs: HashMap<String, Arc<SharedBuf>> = HashMap::new();
 
         while let Some(Envelope {
             event, subagent, ..
-        }) = events.next().await
+        }) = next_event(&mut events, &live_bufs, &out_tx, &sid).await
         {
             // A subagent's turn spends session money even though its events
             // stay out of the transcript.
@@ -1038,13 +1100,29 @@ fn start_event_pump(
                     update
                 }
                 AgentEvent::ToolOutput { id, content } => translate::tool_output(&id, &content),
-                AgentEvent::ToolDone(event) => translate::tool_done(&event, &cwd, home.as_deref()),
+                AgentEvent::LiveToolBuf { id, body } => {
+                    live_bufs.insert(id, body);
+                    continue;
+                }
+                AgentEvent::ToolDone(event) => {
+                    live_bufs.remove(&event.id);
+                    if let Some(plan) = translate::todo_plan(&event) {
+                        session_update(&out_tx, &sid, plan);
+                    }
+                    translate::tool_done(&event, &cwd, home.as_deref())
+                }
                 AgentEvent::TurnComplete(event) => translate::usage_update(&event, cost_total),
                 AgentEvent::ObservationLine { text } => {
                     translate::notice(&MakiId::generate().to_string(), &text)
                 }
+                AgentEvent::CompactionDone {
+                    context_size_after,
+                    context_window,
+                    ..
+                } => translate::context_usage(context_size_after, context_window, cost_total),
                 AgentEvent::Done { reason, .. } => {
                     tool_inputs.clear();
+                    live_bufs.clear();
                     if let Some(id) = finish_turn(&pending) {
                         let resp = PromptResponse::new(translate::map_done_reason(reason));
                         send(
@@ -1059,6 +1137,7 @@ fn start_event_pump(
                     // and the pump outlives the session, so without this the
                     // whole file a `write` was carrying stays pinned forever.
                     tool_inputs.clear();
+                    live_bufs.clear();
                     if let Some(id) = finish_turn(&pending) {
                         let error = if auth {
                             AcpError::auth_required()
@@ -1085,6 +1164,35 @@ fn finish_turn(pending: &PendingState) -> Option<RequestId> {
     let mut pending = pending.lock().unwrap();
     pending.asks.clear();
     pending.prompt.take()
+}
+
+/// A tool streams by appending to a shared buffer instead of sending events,
+/// so while one runs the pump wakes on a timer to forward what it painted.
+/// The TUI is the dirty flag's only other reader, and it never runs here.
+async fn next_event(
+    events: &mut SessionEvents,
+    live_bufs: &HashMap<String, Arc<SharedBuf>>,
+    out_tx: &Sender<Value>,
+    sid: &SessionId,
+) -> Option<Envelope> {
+    loop {
+        if live_bufs.is_empty() {
+            return events.next().await;
+        }
+        let tick = async {
+            Timer::after(LIVE_OUTPUT_POLL).await;
+            None
+        };
+        if let Some(next) = future::or(async { Some(events.next().await) }, tick).await {
+            return next;
+        }
+        for (id, buf) in live_bufs {
+            if let Some(lines) = buf.read_if_dirty() {
+                let text = BufferSnapshot::from_arc(lines).text();
+                session_update(out_tx, sid, translate::tool_output(id, &text));
+            }
+        }
+    }
 }
 
 fn send(out_tx: &Sender<Value>, msg: impl Serialize) {
@@ -1124,6 +1232,7 @@ mod tests {
 
     use maki_agent::permissions::{PermissionCheck, PermissionError, PermissionManager};
     use maki_agent::tools::PermissionScopes;
+    use maki_agent::types::SnapshotLine;
     use maki_agent::{
         CancelToken, DoneReason, EventSender, SubagentInfo, ToolStartEvent, TurnCompleteEvent,
     };
@@ -1131,7 +1240,7 @@ mod tests {
     use maki_config::{AgentConfig, Effect, ToolKey, TrustFileConfig};
     use maki_providers::{ContentBlock as MsgBlock, Message, Role, Timeouts, TokenUsage};
     use maki_storage::StateDir;
-    use maki_storage::sessions::{Session, StoredTokenUsage};
+    use maki_storage::sessions::{Effort, Session, StoredTokenUsage};
     use maki_storage::trusted_folders::{CanonicalFolder, TrustStatus, TrustedFolders};
     use tempfile::TempDir;
     use test_case::test_case;
@@ -1344,6 +1453,35 @@ mod tests {
         })
     }
 
+    fn set_config_request(config_id: &str, value: &str) -> Value {
+        serde_json::json!({
+            "params": { "sessionId": "s", "configId": config_id, "value": value }
+        })
+    }
+
+    #[test_case("high", Some(StoredThinking::Effort { level: Effort::High }) ; "effort_level")]
+    #[test_case("adaptive", Some(StoredThinking::Adaptive) ; "adaptive")]
+    #[test_case("4096", Some(StoredThinking::Budget { tokens: 4096 }) ; "token_budget")]
+    #[test_case("bogus", None ; "unknown_value_is_rejected")]
+    fn set_thinking_config(value: &str, expected: Option<StoredThinking>) {
+        let (mut srv, _answers, _out) = test_server();
+        let result = handle_set_config(
+            &mut srv,
+            &set_config_request(methods::THINKING_CONFIG_ID, value),
+        );
+        let thinking = srv.session.as_ref().unwrap().thinking;
+        match expected {
+            Some(expected) => {
+                result.unwrap();
+                assert_eq!(thinking, expected);
+            }
+            None => {
+                assert!(result.is_err());
+                assert_eq!(thinking, StoredThinking::Off);
+            }
+        }
+    }
+
     #[test_case(allow_once(ANSWERED_ID), PermissionAnswer::AllowOnce ; "selected_option")]
     #[test_case(serde_json::json!({ "id": ANSWERED_ID, "result": { "outcome": { "outcome": "cancelled" } } }), PermissionAnswer::Deny ; "cancelled_outcome")]
     #[test_case(serde_json::json!({ "id": ANSWERED_ID, "result": { "nonsense": true } }), PermissionAnswer::Deny ; "unparsable_result")]
@@ -1383,11 +1521,36 @@ mod tests {
                 mcp: None,
                 current_mode: AgentMode::Build,
                 current_model: String::new(),
+                thinking: StoredThinking::Off,
                 pending: Arc::default(),
                 claim,
+                custom_commands: Vec::new(),
             }),
         };
         (server, answer_rx, out_rx)
+    }
+
+    fn prompt_request(text: &str) -> Value {
+        serde_json::json!({
+            "params": { "sessionId": "s", "prompt": [{ "type": "text", "text": text }] }
+        })
+    }
+
+    #[test_case("/compact", Some(None) ; "bare_compact")]
+    #[test_case("/compact keep the plan", Some(Some("keep the plan")) ; "compact_with_guidance")]
+    #[test_case("hello", None ; "plain_prompt")]
+    fn prompt_routes_compact_to_the_session(text: &str, expected: Option<Option<&str>>) {
+        let (mut srv, ..) = test_server();
+        let (input_tx, input_rx) = flume::unbounded();
+        srv.session.as_mut().unwrap().handle.input_tx = input_tx;
+        handle_prompt(&mut srv, &prompt_request(text), &RequestId::Number(1)).unwrap();
+        match (input_rx.try_recv().unwrap(), expected) {
+            (InteractiveInput::Compact(instructions), Some(expected)) => {
+                assert_eq!(instructions.as_deref(), expected);
+            }
+            (InteractiveInput::Prompt(input), None) => assert_eq!(input.message, text),
+            _ => panic!("{text} was routed to the wrong input"),
+        }
     }
 
     fn acp_params(storage: StateDir) -> AcpParams {
@@ -1496,6 +1659,8 @@ mod tests {
     /// mints unique ids now, but a provider can still repeat one, and the pump
     /// has to keep the runs apart either way.
     const COLLIDING_TOOL_USE_ID: &str = "maki_unnamed_0";
+    const LIVE_TOOL_ID: &str = "tu-live";
+    const LIVE_LINE: &str = "compiling maki-acp";
     /// These cover cost and transcript plumbing, not the trust-scoped wording
     /// of permission options.
     const PUMP_TRUSTED: bool = true;
@@ -2013,6 +2178,35 @@ mod tests {
         assert!(
             out_rx.is_empty(),
             "the subagent turn pays but stays out of the transcript"
+        );
+    }
+
+    #[test]
+    fn next_event_streams_a_live_tool_buffer_while_waiting() {
+        let (out_tx, out_rx) = flume::unbounded();
+        let (_guard, mut events) = maki_agent::event_stream();
+        let buf = Arc::new(SharedBuf::new());
+        buf.append(SnapshotLine::plain(LIVE_LINE.to_owned()));
+        let live_bufs = HashMap::from([(LIVE_TOOL_ID.to_owned(), buf)]);
+        let sid = SessionId::from(LIVE_TOOL_ID);
+
+        let streamed = smol::block_on(future::or(
+            async {
+                next_event(&mut events, &live_bufs, &out_tx, &sid).await;
+                None
+            },
+            async { out_rx.recv_async().await.ok() },
+        ))
+        .expect("the painted buffer reaches the client before any event");
+
+        let update = &streamed["params"]["update"];
+        assert_eq!(update["sessionUpdate"], "tool_call_update");
+        assert_eq!(update["toolCallId"], LIVE_TOOL_ID);
+        assert!(
+            update["content"][0]["content"]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains(LIVE_LINE)),
+            "{update}"
         );
     }
 

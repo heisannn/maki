@@ -144,6 +144,7 @@ event-listener = "5"
 futures-lite = "2"
 futures = "0.3"
 isahc = { version = "2.0", default-features = false, features = ["text-decoding", "static-curl", "rustls-tls", "http2"] }
+httparse = "1"
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 async-compat = "0.2"
 futures-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs"] }

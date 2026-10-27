@@ -8,8 +8,8 @@ use crate::model::{Model, ModelEntry, ModelFamily, ModelTier};
 use crate::pricing::PricingSchedule;
 use crate::provider::Provider;
 use crate::providers::{
-    ResolvedAuth, Timeouts, anthropic, aperture, copilot, custom, google, llama_cpp, ollama,
-    openai, opencode, plugin, xai, zai,
+    ResolvedAuth, Timeouts, anthropic, aperture, claude_code, copilot, custom, google, llama_cpp,
+    ollama, openai, opencode, plugin, xai, zai,
 };
 use crate::types::ThinkingFallback;
 use crate::{AgentError, Effort};
@@ -67,6 +67,9 @@ pub struct ProviderSpec {
     /// `None` ignores the fields, `Some` names their fallback. This also says
     /// whether a toggle fragment can carry an explicit token budget.
     pub thinking_fields_fallback: fn(&Model) -> Option<ThinkingFallback>,
+    /// `Some` where the provider takes only these effort levels: no off, no
+    /// adaptive and no raw token budget. Read through [`Model::effort_ladder`].
+    pub effort_ladder: Option<&'static [Effort]>,
     pub accepts_arbitrary_models: bool,
     pub fallback_max_output: Option<u32>,
     pub fallback_context_window: u32,
@@ -110,10 +113,22 @@ pub type WithAuthFn = fn(Arc<Mutex<ResolvedAuth>>, Timeouts, Option<String>) -> 
 pub enum Build {
     /// A bespoke `impl Provider`.
     Native(Native),
+    /// A local transport that owns authentication outside maki.
+    Local(Local),
     /// A Lua plugin's declaration, with the model rows it states.
     Declared(&'static [ModelEntry]),
     /// `catalog::try_create`, out of models.dev. The row carries metadata only.
     Catalog,
+}
+
+/// A local transport serves another provider's models, so it lends that
+/// provider's curated table instead of keeping a copy that drifts.
+#[derive(Debug, Clone, Copy)]
+pub struct Local {
+    pub new: NewFn,
+    pub models_from: &'static str,
+    /// The canonical ids, out of that table, that this transport serves.
+    pub models: &'static [&'static str],
 }
 
 /// How maki builds a provider that has its own `impl Provider`.
@@ -183,14 +198,14 @@ impl ProviderSpec {
     pub fn models(&self) -> &'static [ModelEntry] {
         match self.build {
             Build::Declared(models) => models,
-            Build::Native(_) | Build::Catalog => manifest::table(self.slug),
+            Build::Native(_) | Build::Local(_) | Build::Catalog => manifest::table(self.slug),
         }
     }
 
     pub const fn native(&self) -> Option<Native> {
         match self.build {
             Build::Native(native) => Some(native),
-            Build::Declared(_) | Build::Catalog => None,
+            Build::Local(_) | Build::Declared(_) | Build::Catalog => None,
         }
     }
 
@@ -223,6 +238,7 @@ impl ProviderSpec {
 /// addresses: identify a spec by `slug`, never by pointer.
 const BUILTINS: &[ProviderSpec] = &[
     anthropic::SPEC,
+    claude_code::SPEC,
     openai::SPEC,
     google::SPEC,
     copilot::SPEC,
@@ -321,6 +337,13 @@ impl Owner {
         if let Some(native) = builtin.and_then(ProviderSpec::native) {
             return Self::Builtin(native.new);
         }
+        if let Some(ProviderSpec {
+            build: Build::Local(local),
+            ..
+        }) = builtin
+        {
+            return Self::Builtin(local.new);
+        }
         if custom::base_spec(slug).is_some() {
             return Self::Custom;
         }
@@ -350,7 +373,7 @@ mod tests {
         assert_eq!(registry.len(), BUILTINS.len(), "duplicate slug in BUILTINS");
         for spec in BUILTINS {
             let built = match spec.build {
-                Build::Native(_) => true,
+                Build::Native(_) | Build::Local(_) => true,
                 Build::Declared(_) => false,
                 Build::Catalog => CATALOG_BACKED_BUILTINS.contains(&spec.slug),
             };

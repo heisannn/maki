@@ -29,7 +29,7 @@ You can set multiple API keys in one env var (`ANTHROPIC_API_KEY=sk-1,sk-2,sk-3`
 
 const BASE_URL_OVERRIDES: &str = r#"## Base URL Overrides
 
-Every provider honors a `<SLUG>_BASE_URL` env var (`anthropic` -> `ANTHROPIC_BASE_URL`, `llama-cpp` -> `LLAMA_CPP_BASE_URL`). Set it to the origin of a proxy or a compatible endpoint and Maki appends the API paths itself:
+HTTP providers honor a `<SLUG>_BASE_URL` env var (`anthropic` -> `ANTHROPIC_BASE_URL`, `llama-cpp` -> `LLAMA_CPP_BASE_URL`). Set it to the origin of a proxy or a compatible endpoint and Maki appends the API paths itself:
 
 ```sh
 ANTHROPIC_BASE_URL=https://my-proxy.internal maki
@@ -42,7 +42,7 @@ Built-in, plugin and `providers.toml` providers all read it. When several origin
 3. `base_url` in `providers.toml`.
 4. The provider's own default `base_url`.
 
-`ANTHROPIC_BASE_URL` and `OPENAI_BASE_URL` are the same names the official SDKs use, so an existing proxy setup carries over as is. Two exceptions: `OPENAI_BASE_URL` only redirects the platform API, never the ChatGPT Coding Plan backend; `XAI_BASE_URL` only redirects the public API-key endpoint, never the OAuth CLI proxy.
+`ANTHROPIC_BASE_URL` and `OPENAI_BASE_URL` are the same names the official SDKs use, so an existing proxy setup carries over as is. `OPENAI_BASE_URL` only redirects the platform API, never the ChatGPT Coding Plan backend. `XAI_BASE_URL` only redirects the public API-key endpoint, never the OAuth CLI proxy. The `claude-code` transport uses the official CLI and rejects endpoint overrides.
 
 You can also set `base_url` for a built-in provider in `~/.config/maki/providers.toml`. It overrides the built-in default and loses to the env var above:
 
@@ -566,11 +566,16 @@ fn write_section(out: &mut String, spec: &ProviderSpec) {
         AuthDoc::EnvVarWith(note) => format!("`{}` {note}", spec.api_key_env),
         AuthDoc::Custom(line) => line.to_string(),
     };
-    let _ = writeln!(out, "- **Env var**: {auth_line}");
+    let auth_label = if spec.api_key_env.is_empty() {
+        "Auth"
+    } else {
+        "Env var"
+    };
+    let _ = writeln!(out, "- **{auth_label}**: {auth_line}");
 
     if let [url] = docs.api_urls {
         let _ = writeln!(out, "- **API**: `{url}`");
-    } else {
+    } else if !docs.api_urls.is_empty() {
         let _ = writeln!(out, "- **API endpoints**:");
         for url in docs.api_urls {
             let _ = writeln!(out, "  - `{url}`");
@@ -616,7 +621,7 @@ fn render() -> String {
     let _ = writeln!(out, "# Providers\n");
     let _ = writeln!(
         out,
-        "Maki talks to LLM providers over their HTTP APIs. \
+        "Maki talks to LLM providers over HTTP APIs or the Claude Code CLI. \
          Models are split into three tiers: **weak** (cheap and fast), \
          **medium** (balanced), and **strong** (highest capability, highest cost). \
          There is also a **compaction** tier for choosing a dedicated model to summarize context when the conversation grows long.\n"

@@ -194,15 +194,21 @@ impl SessionTrack {
     /// turn really runs under, so readers and the saved file never report a
     /// mode the driver switched away from.
     pub fn turn(&mut self, model_spec: String, input: &AgentInput) -> SessionTurn<'_> {
-        let session = &mut self.store.session;
-        session.set_model(model_spec);
-        session.meta.mode = Some(match input.mode {
+        let meta = &mut self.store.session.meta;
+        meta.mode = Some(match input.mode {
             AgentMode::Build => StoredMode::Build,
             AgentMode::Plan(_) => StoredMode::Plan,
         });
-        session.meta.thinking = Some(input.thinking.into());
-        session.meta.fast = input.fast;
-        session.meta.workflow = input.workflow;
+        meta.thinking = Some(input.thinking.into());
+        meta.fast = input.fast;
+        meta.workflow = input.workflow;
+        self.turn_keeping_settings(model_spec)
+    }
+
+    /// A turn with no prompt of its own, such as a compaction, runs under no
+    /// settings, so the stored ones stand.
+    pub fn turn_keeping_settings(&mut self, model_spec: String) -> SessionTurn<'_> {
+        self.store.session.set_model(model_spec);
         self.store.publish_header(true);
         SessionTurn {
             track: self,

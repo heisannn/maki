@@ -13,6 +13,18 @@ context_window = 200000
 deferred_tools = true
 pricing = { input = 1.0, output = 5.0, cache_write = 1.25, cache_read = 0.1 }
 
+
+[[model]]
+# Rates for prompts up to 100K tokens; 0.50 / 2.50 beyond.
+prefixes = ["claude-haiku-5-5"]
+tier = "weak"
+family = "claude"
+vision = true
+default = false
+max_output_tokens = 128000
+context_window = 200000
+deferred_tools = true
+pricing = { input = 0.1, output = 0.5, cache_write = 0.125, cache_read = 0.01 }
 [[model]]
 prefixes = ["claude-sonnet-4-5"]
 tier = "medium"
@@ -47,6 +59,17 @@ context_window = 200000
 deferred_tools = true
 pricing = { input = 2.0, output = 10.0, cache_write = 2.5, cache_read = 0.2 }
 
+
+[[model]]
+prefixes = ["claude-sonnet-5-5"]
+tier = "medium"
+family = "claude"
+vision = true
+default = false
+max_output_tokens = 128000
+context_window = 200000
+deferred_tools = true
+pricing = { input = 2.0, output = 10.0, cache_write = 2.5, cache_read = 0.2 }
 [[model]]
 # No tool search before the 4.5 generation, so MCP tools are never deferred.
 prefixes = ["claude-sonnet-4"]
@@ -116,6 +139,17 @@ context_window = 200000
 deferred_tools = true
 pricing = { input = 5.0, output = 25.0, cache_write = 6.25, cache_read = 0.5, fast = { input = 10.0, output = 50.0 } }
 
+
+[[model]]
+prefixes = ["claude-opus-5-5"]
+tier = "strong"
+family = "claude"
+vision = true
+default = false
+max_output_tokens = 128000
+context_window = 200000
+deferred_tools = true
+pricing = { input = 4.0, output = 20.0, cache_write = 5.0, cache_read = 0.2, fast = { input = 8.0, output = 40.0 } }
 [[model]]
 prefixes = ["claude-fable-5"]
 tier = "strong"
@@ -127,6 +161,17 @@ context_window = 200000
 deferred_tools = true
 pricing = { input = 10.0, output = 50.0, cache_write = 12.5, cache_read = 1.0 }
 
+
+[[model]]
+prefixes = ["claude-fable-5-1"]
+tier = "strong"
+family = "claude"
+vision = true
+default = false
+max_output_tokens = 128000
+context_window = 200000
+deferred_tools = true
+pricing = { input = 10.0, output = 50.0, cache_write = 12.5, cache_read = 0.25 }
 [[model]]
 # No tool search before the 4.5 generation, so MCP tools are never deferred.
 # Opus 4.0's dated id has no `-0`, so it is listed whole.

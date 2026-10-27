@@ -7,7 +7,7 @@ group = "Reference"
 
 # Providers
 
-Maki talks to LLM providers over their HTTP APIs. Models are split into three tiers: **weak** (cheap and fast), **medium** (balanced), and **strong** (highest capability, highest cost). There is also a **compaction** tier for choosing a dedicated model to summarize context when the conversation grows long.
+Maki talks to LLM providers over HTTP APIs or the Claude Code CLI. Models are split into three tiers: **weak** (cheap and fast), **medium** (balanced), and **strong** (highest capability, highest cost). There is also a **compaction** tier for choosing a dedicated model to summarize context when the conversation grows long.
 
 Open the model picker with `/model` and press `!`, `@`, `#`, or `$` on any row to assign it to strong, medium, weak, or compaction. Press the same key again to remove the assignment. Your overrides are saved to `~/.local/state/maki/model-tiers` and apply across sessions.
 
@@ -19,7 +19,7 @@ You can set multiple API keys in one env var (`ANTHROPIC_API_KEY=sk-1,sk-2,sk-3`
 
 ## Base URL Overrides
 
-Every provider honors a `<SLUG>_BASE_URL` env var (`anthropic` -> `ANTHROPIC_BASE_URL`, `llama-cpp` -> `LLAMA_CPP_BASE_URL`). Set it to the origin of a proxy or a compatible endpoint and Maki appends the API paths itself:
+HTTP providers honor a `<SLUG>_BASE_URL` env var (`anthropic` -> `ANTHROPIC_BASE_URL`, `llama-cpp` -> `LLAMA_CPP_BASE_URL`). Set it to the origin of a proxy or a compatible endpoint and Maki appends the API paths itself:
 
 ```sh
 ANTHROPIC_BASE_URL=https://my-proxy.internal maki
@@ -32,7 +32,7 @@ Built-in, plugin and `providers.toml` providers all read it. When several origin
 3. `base_url` in `providers.toml`.
 4. The provider's own default `base_url`.
 
-`ANTHROPIC_BASE_URL` and `OPENAI_BASE_URL` are the same names the official SDKs use, so an existing proxy setup carries over as is. Two exceptions: `OPENAI_BASE_URL` only redirects the platform API, never the ChatGPT Coding Plan backend; `XAI_BASE_URL` only redirects the public API-key endpoint, never the OAuth CLI proxy.
+`ANTHROPIC_BASE_URL` and `OPENAI_BASE_URL` are the same names the official SDKs use, so an existing proxy setup carries over as is. `OPENAI_BASE_URL` only redirects the platform API, never the ChatGPT Coding Plan backend. `XAI_BASE_URL` only redirects the public API-key endpoint, never the OAuth CLI proxy. The `claude-code` transport uses the official CLI and rejects endpoint overrides.
 
 You can also set `base_url` for a built-in provider in `~/.config/maki/providers.toml`. It overrides the built-in default and loses to the env var above:
 
@@ -56,16 +56,20 @@ The built-in provider still owns the slug, so `protocol`, `api_key_env`, `discov
 | Tier | Models | Pricing (in/out per 1M tokens) | Context |
 |------|--------|-------------------------------|---------|
 | Weak | **claude-haiku-4-5** (default) | $1.00 / $5.00 | 200K ctx / 64K out |
+| Weak | claude-haiku-5-5 | $0.10 / $0.50 | 200K ctx / 128K out |
 | Medium | claude-sonnet-4-5 | $3.00 / $15.00 | 200K ctx / 64K out |
 | Medium | claude-sonnet-4-6 | $3.00 / $15.00 | 200K ctx / 64K out |
 | Medium | **claude-sonnet-5** (default) | $2.00 / $10.00 | 200K ctx / 128K out |
+| Medium | claude-sonnet-5-5 | $2.00 / $10.00 | 200K ctx / 128K out |
 | Medium | claude-sonnet-4 | $3.00 / $15.00 | 200K ctx / 64K out |
 | Strong | claude-opus-4-5 | $5.00 / $25.00 | 200K ctx / 64K out |
 | Strong | claude-opus-4-6 | $5.00 / $25.00 | 200K ctx / 128K out |
 | Strong | claude-opus-4-7 | $5.00 / $25.00 | 200K ctx / 128K out |
 | Strong | claude-opus-4-8 | $5.00 / $25.00 | 200K ctx / 128K out |
 | Strong | **claude-opus-5** (default) | $5.00 / $25.00 | 200K ctx / 128K out |
+| Strong | claude-opus-5-5 | $4.00 / $20.00 | 200K ctx / 128K out |
 | Strong | claude-fable-5 | $10.00 / $50.00 | 200K ctx / 128K out |
+| Strong | claude-fable-5-1 | $10.00 / $50.00 | 200K ctx / 128K out |
 | Strong | claude-opus-4-0, claude-opus-4-1, claude-opus-4-20250514 | $15.00 / $75.00 | 200K ctx / 32K out |
 
 Defaults: claude-haiku-4-5 (weak), claude-sonnet-5 (medium), claude-opus-5 (strong)
@@ -86,6 +90,21 @@ You will need `AWS_REGION` and one of the following for auth:
 | Gateway proxy | `CLAUDE_CODE_SKIP_BEDROCK_AUTH=1` + `ANTHROPIC_BEDROCK_BASE_URL` (skips signing, useful behind a proxy that handles auth) |
 
 You can override the model with `ANTHROPIC_MODEL` and the endpoint with `ANTHROPIC_BEDROCK_BASE_URL`. These env var names match Claude Code, so if you were already using Bedrock there, the same setup works here.
+
+### Claude Code (experimental)
+
+- **Auth**: Run `claude auth login` with a Claude subscription. Maki uses the official CLI and leaves credential storage and refresh to Claude Code.
+- **Features**: Claude Code CLI transport, prompt caching, thinking and Maki tools
+
+The picker lists Claude Opus 5.5, Fable 5.1, Sonnet 5.5 and Haiku 5.5 from the Anthropic provider's table, billed at $0 with the list price shown as a reference. Thinking takes the effort levels `low`, `medium`, `high`, `xhigh` and `max`.
+
+Requires Claude Code on `PATH`. Choose a model with `maki --model claude-code/claude-sonnet-5-5` after `claude auth login`. Set `MAKI_CLAUDE_CODE_COMMAND` to use another executable and `MAKI_CLAUDE_CODE_CONFIG_DIR` to use another Claude Code configuration directory.
+
+Maki owns conversation history, permissions and tool execution. Each model turn starts a CLI process with its tools disabled and a private loopback relay that permits one upstream generation. Requests use Claude Code's authentication. Maki does not store its tokens.
+
+This integration is experimental and depends on Claude Code's wire format. Plan access, usage limits and billing are controlled by Anthropic. Maki stops if Claude Code reports usage-credit overage. Set `MAKI_CLAUDE_CODE_ALLOW_USAGE_CREDITS=1` to allow further turns charged to usage credits. The turn that reports overage has already been sent.
+
+API-key and alternate-backend environment overrides are rejected to avoid silently changing billing. `CLAUDE_CODE_BASE_URL` and provider endpoint/header overrides are unsupported. Each turn replays Maki's history. CLI process reuse is not implemented.
 
 ### OpenAI
 
@@ -248,7 +267,7 @@ If `~/.grok/auth.json` already exists, login offers to reuse it without writing 
 
 ### Aperture
 
-- **Env var**: `APERTURE_HOST` (e.g. `https://your-host.tailnet.ts.net`)
+- **Auth**: `APERTURE_HOST` (e.g. `https://your-host.tailnet.ts.net`)
 - **API**: `Aperture gateway (set APERTURE_HOST)`
 - **Features**: Tailscale Aperture LLM gateway; set APERTURE_HOST or configure in providers.toml
 

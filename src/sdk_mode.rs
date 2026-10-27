@@ -701,7 +701,7 @@ pub fn run(params: SdkParams) -> Result<()> {
                     defaults,
                     InputSource::Headless,
                 );
-                if handle.input_tx.send(input).is_err() {
+                if handle.input_tx.send(input.into()).is_err() {
                     break;
                 }
             }

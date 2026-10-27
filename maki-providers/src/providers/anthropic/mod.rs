@@ -81,6 +81,7 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     supports_deferred_tools: true,
     adaptive_effort: api_decides,
     thinking_fields_fallback: |_| None,
+    effort_ladder: None,
     accepts_arbitrary_models: false,
     fallback_max_output: Some(128_000),
     fallback_context_window: 200_000,

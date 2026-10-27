@@ -2,12 +2,16 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use agent_client_protocol_schema::v1::{
-    Content, ContentBlock, ContentChunk, Cost, Diff, ImageContent, SessionUpdate, StopReason,
-    TextContent, ToolCall, ToolCallContent, ToolCallId, ToolCallLocation, ToolCallStatus,
-    ToolCallUpdate, ToolCallUpdateFields, ToolKind, UsageUpdate,
+    Content, ContentBlock, ContentChunk, Cost, Diff, ImageContent, Plan, PlanEntry,
+    PlanEntryPriority, PlanEntryStatus, SessionUpdate, StopReason, TextContent, ToolCall,
+    ToolCallContent, ToolCallId, ToolCallLocation, ToolCallStatus, ToolCallUpdate,
+    ToolCallUpdateFields, ToolKind, UsageUpdate,
 };
-use maki_agent::tools::ToolRegistry;
-use maki_agent::types::{ToolDoneEvent, ToolOutput, ToolStartEvent, TurnCompleteEvent};
+use maki_agent::tools::{TODOWRITE_TOOL_NAME, ToolRegistry};
+use maki_agent::types::{
+    TodoItem, TodoPriority, TodoStatus, ToolDoneEvent, ToolOutput, ToolStartEvent,
+    TurnCompleteEvent,
+};
 use maki_agent::{DisplayItem, DoneReason, display_order};
 use maki_providers::{ContentBlock as MsgBlock, ImageMediaType, Message, Role as MsgRole};
 
@@ -19,6 +23,7 @@ const MAX_DIFF_OLD_TEXT_BYTES: u64 = 256 * 1024;
 /// Model pricing is quoted in US dollars, so that is the reported currency.
 const CURRENCY: &str = "USD";
 const NOTICE_ID_PREFIX: &str = "notice-";
+const TODOS_FIELD: &str = "todos";
 
 /// File-level tools report a location so the client can follow along. Directory
 /// scoped tools (glob, grep, list) and commands (bash) target no single file.
@@ -308,6 +313,34 @@ pub fn tool_output(id: &str, content: &str) -> SessionUpdate {
     ))
 }
 
+/// `todo_write` answers the model with nothing useful, so the list a client
+/// shows as its plan is read back from the call's input.
+pub fn todo_plan(event: &ToolDoneEvent) -> Option<SessionUpdate> {
+    if event.is_error || &*event.tool != TODOWRITE_TOOL_NAME {
+        return None;
+    }
+    let todos = event.call.as_ref()?.input.get(TODOS_FIELD)?;
+    let items: Vec<TodoItem> = serde_json::from_value(todos.clone()).ok()?;
+    let entries = items
+        .into_iter()
+        .filter_map(|item| {
+            let status = match item.status {
+                TodoStatus::Pending => PlanEntryStatus::Pending,
+                TodoStatus::InProgress => PlanEntryStatus::InProgress,
+                TodoStatus::Completed => PlanEntryStatus::Completed,
+                TodoStatus::Cancelled => return None,
+            };
+            let priority = match item.priority {
+                TodoPriority::High => PlanEntryPriority::High,
+                TodoPriority::Medium => PlanEntryPriority::Medium,
+                TodoPriority::Low => PlanEntryPriority::Low,
+            };
+            Some(PlanEntry::new(item.content, priority, status))
+        })
+        .collect();
+    Some(SessionUpdate::Plan(Plan::new(entries)))
+}
+
 pub fn tool_done(event: &ToolDoneEvent, cwd: &Path, home: Option<&Path>) -> SessionUpdate {
     let status = if event.is_error {
         ToolCallStatus::Failed
@@ -379,8 +412,14 @@ pub fn map_done_reason(reason: DoneReason) -> StopReason {
 pub fn usage_update(event: &TurnCompleteEvent, cost_total: Option<f64>) -> SessionUpdate {
     let used = event
         .context_size
-        .unwrap_or_else(|| event.usage.context_tokens()) as u64;
-    let mut update = UsageUpdate::new(used, u64::from(event.context_window));
+        .unwrap_or_else(|| event.usage.context_tokens());
+    context_usage(used, event.context_window, cost_total)
+}
+
+/// Compaction is the one thing that shrinks the context with no turn behind
+/// it, so the gauge is set straight from the size it left.
+pub fn context_usage(used: u32, context_window: u32, cost_total: Option<f64>) -> SessionUpdate {
+    let mut update = UsageUpdate::new(u64::from(used), u64::from(context_window));
     if let Some(cost) = cost_total {
         update = update.cost(Cost::new(cost, CURRENCY));
     }
@@ -500,7 +539,9 @@ fn mime_type(media: &ImageMediaType) -> &'static str {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::time::Duration;
 
+    use maki_agent::CallRecord;
     use maki_providers::ImageSource;
     use serde_json::json;
     use tempfile::TempDir;
@@ -522,6 +563,9 @@ mod tests {
     const PROMPT: &str = "what changed";
     const REPLY: &str = "the build is green";
     const CONTEXT_UPDATE_TEXT: &str = "<context-update>date: tomorrow</context-update>";
+    const TODO_DONE: &str = "read the code";
+    const TODO_ACTIVE: &str = "write the fix";
+    const TODO_DROPPED: &str = "rewrite everything";
 
     #[test_case("1: mod render\n2: mod segment", "```\n1: mod render\n2: mod segment\n```" ; "plain_text_gets_default_fence")]
     #[test_case("has ```rust\ncode\n``` inside", "````\nhas ```rust\ncode\n``` inside\n````" ; "fence_longer_than_inner_backticks")]
@@ -802,6 +846,42 @@ mod tests {
             .unwrap()
             .get("locations")
             .cloned()
+    }
+
+    fn todo_event(is_error: bool) -> ToolDoneEvent {
+        let mut event = done_event(
+            TODOWRITE_TOOL_NAME,
+            ToolOutput::Plain(String::new().into()),
+            is_error,
+            None,
+        );
+        event.call = Some(Box::new(CallRecord {
+            input: json!({ TODOS_FIELD: [
+                { "content": TODO_DONE, "status": "completed", "priority": "high" },
+                { "content": TODO_ACTIVE, "status": "in_progress" },
+                { "content": TODO_DROPPED, "status": "cancelled" },
+            ]}),
+            duration: Duration::ZERO,
+        }));
+        event
+    }
+
+    #[test]
+    fn todo_plan_mirrors_the_list_without_cancelled_items() {
+        let plan = serde_json::to_value(todo_plan(&todo_event(false)).unwrap()).unwrap();
+        assert_eq!(plan["sessionUpdate"], "plan");
+        assert_eq!(
+            plan["entries"],
+            json!([
+                { "content": TODO_DONE, "priority": "high", "status": "completed" },
+                { "content": TODO_ACTIVE, "priority": "medium", "status": "in_progress" },
+            ])
+        );
+    }
+
+    #[test]
+    fn todo_plan_skips_a_failed_call() {
+        assert!(todo_plan(&todo_event(true)).is_none());
     }
 
     #[test]

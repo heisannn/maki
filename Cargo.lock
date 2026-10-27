@@ -3471,6 +3471,7 @@ dependencies = [
  "futures-lite",
  "getrandom 0.4.3",
  "hmac",
+ "httparse",
  "image",
  "inventory",
  "isahc",

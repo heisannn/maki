@@ -14,7 +14,7 @@ use serde_json::Value;
 use smol::lock::Mutex;
 use tracing::error;
 
-use crate::agent::{self, RunContext, RunContextBuilder};
+use crate::agent::{self, AgentHooks, RunContext, RunContextBuilder};
 use crate::cancel::{CancelMap, CancelToken};
 use crate::permissions::{PermissionManager, PluginRuleStore};
 use crate::prompt::ResolvedPrompts;
@@ -23,9 +23,9 @@ use crate::template;
 use crate::tools::{FileAccess, LocalTools, RequestTools, ToolAudience, ToolRegistry};
 use crate::types::EventSender;
 use crate::{
-    Agent, AgentConfig, AgentEvent, AgentInput, AgentMode, AgentParams, EventStreamGuard,
-    ImageSource, InputSource, McpHandle, McpSession, PermissionsConfig, SessionEvents,
-    SessionMailbox, ToolDeferral, ToolOutputLines, event_stream,
+    Agent, AgentConfig, AgentError, AgentEvent, AgentInput, AgentMode, AgentParams,
+    EventStreamGuard, ImageSource, InputSource, McpHandle, McpSession, PermissionsConfig,
+    SessionEvents, SessionMailbox, ToolDeferral, ToolOutputLines, event_stream,
 };
 
 const SESSION_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -247,11 +247,7 @@ pub fn spawn(params: HeadlessParams) -> (HeadlessHandle, SessionEvents) {
 
         let result = agent.run(input).await;
         drop(agent);
-
-        if let Err(e) = result {
-            error!(error = %e, "agent error");
-            let _ = error_tx.send(AgentEvent::error(&e));
-        }
+        finish_run(result, &error_tx);
     }));
     (
         HeadlessHandle {
@@ -292,9 +288,21 @@ pub struct InteractiveParams {
     pub local_tools: LocalTools,
 }
 
+pub enum InteractiveInput {
+    Prompt(AgentInput),
+    /// `/compact`, carrying the guidance typed after it.
+    Compact(Option<String>),
+}
+
+impl From<AgentInput> for InteractiveInput {
+    fn from(input: AgentInput) -> Self {
+        Self::Prompt(input)
+    }
+}
+
 pub struct InteractiveHandle {
     pub tool_names: Vec<String>,
-    pub input_tx: flume::Sender<AgentInput>,
+    pub input_tx: flume::Sender<InteractiveInput>,
     pub answer_tx: flume::Sender<String>,
     pub cancel_tx: flume::Sender<()>,
     pub model_tx: flume::Sender<Model>,
@@ -329,7 +337,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
 
     let (guard, events) = event_stream();
     let base_tx = guard.sender(0);
-    let (input_tx, input_rx) = flume::unbounded::<AgentInput>();
+    let (input_tx, input_rx) = flume::unbounded::<InteractiveInput>();
     let (answer_tx, answer_rx) = flume::unbounded::<String>();
     let (cancel_tx, cancel_rx) = flume::bounded::<()>(1);
     let (model_tx, model_rx) = flume::unbounded::<Model>();
@@ -399,6 +407,46 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
 
             while answer_rx.lock().await.try_recv().is_ok() {}
 
+            let input = match input {
+                InteractiveInput::Prompt(input) => input,
+                InteractiveInput::Compact(instructions) => {
+                    let mut turn = track.turn_keeping_settings(model.spec());
+                    let (compact_provider, compact_model) = agent::resolve_compaction_model(
+                        &provider,
+                        &model,
+                        params.timeouts,
+                        &params.model_policy,
+                    )
+                    .await;
+                    let run = turn.run_params(event_tx, Arc::clone(&context));
+                    let hooks = AgentHooks {
+                        registry: ToolRegistry::global(),
+                        session_id: Some(&session_ref_clone),
+                        task_id: None,
+                        model: &model,
+                        cancel: &cancel,
+                        context_size: run.gauge.size(),
+                    };
+                    let result = agent::compact(
+                        &*compact_provider,
+                        &compact_model,
+                        run.history,
+                        run.gauge,
+                        context(&model, params.defaults.workflow),
+                        mcp.as_ref(),
+                        &run.event_tx,
+                        &hooks,
+                        &params.config,
+                        instructions.as_deref(),
+                        params.timeouts.retry,
+                    )
+                    .await;
+                    cancel_task.cancel().await;
+                    finish_run(result, &error_tx);
+                    run_id += 1;
+                    continue;
+                }
+            };
             // Outlives `agent`, so this turn is on disk before the next prompt
             // is read, without the loop body remembering to write it.
             let mut turn = track.turn(model.spec(), &input);
@@ -433,12 +481,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
             let result = agent.run(input).await;
             drop(agent);
             cancel_task.cancel().await;
-
-            if let Err(ref e) = result {
-                error!(error = %e, "agent error");
-                let _ = error_tx.send(AgentEvent::error(e));
-            }
-
+            finish_run(result, &error_tx);
             run_id += 1;
         }
     }));
@@ -456,6 +499,13 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
         },
         events,
     )
+}
+
+fn finish_run<T>(result: Result<T, AgentError>, error_tx: &EventSender) {
+    if let Err(e) = result {
+        error!(error = %e, "agent error");
+        let _ = error_tx.send(AgentEvent::error(&e));
+    }
 }
 
 /// Waits for a session task that has nothing left to do but tear MCP down,

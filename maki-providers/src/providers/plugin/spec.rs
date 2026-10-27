@@ -90,6 +90,10 @@ fn spec_row(decl: &ProviderDecl, target: Target, models: &'static [ModelEntry]) 
             Target::Base(spec) => spec.thinking_fields_fallback,
             Target::Codec(_) => declared_thinking_fields_fallback,
         },
+        effort_ladder: match target {
+            Target::Base(spec) => spec.effort_ladder,
+            Target::Codec(_) => None,
+        },
         accepts_arbitrary_models: decl
             .accepts_arbitrary_models
             .unwrap_or(accepts_arbitrary_models),

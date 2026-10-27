@@ -38,10 +38,13 @@ The `model` value is a `provider/model-id` spec, same format as `maki --model`.
 - **Sessions persist.** Loading a session replays the full conversation in the editor, so you can resume where you left off.
 - **Resume picker.** Editors can list this project's stored sessions, newest first, to resume an old transcript instead of starting a blank one.
 - **Model switching.** Pick a model from the editor's dropdown, mid-session. All configured providers show up. Providers that list their models over the wire (OpenRouter and friends) are discovered in the background, so the dropdown keeps filling up for a moment after the session starts, one provider at a time.
+- **Thinking.** Pick the thinking level (off, or minimal through max) from the editor, mid-session. It starts at your `always_thinking` config, or off.
 - **Modes.** Switch between build (full access) and plan (plan-file writes only) from the editor.
+- **Slash commands.** `/compact` (with optional guidance) and your [custom commands](/docs/commands/) show up in the editor's slash menu. Custom commands are named `project:<name>` or `user:<name>`. Other TUI commands are not available over ACP.
 - **Permissions.** Tool permission prompts appear in the editor: allow or reject, once or always.
 - **Questions.** The `question` tool becomes a native form in the editor (ACP elicitation). If the client does not support elicitation, the tool is dropped and the model asks in plain text.
-- **Live tool calls.** Tool progress streams as it happens, including sub-agents and batched calls.
+- **Live tool calls.** Tool output streams into the editor while the tool runs, so a long `bash` command shows progress before it finishes. A sub-agent appears as its single `task` call. Calls inside `batch` and `code_execution` appear in the parent call's output.
+- **Plan.** Each `todo_write` updates the editor's plan view. Cancelled items are left out, since ACP has no cancelled status.
 - **Images and context.** Prompts can include images and editor-attached files.
 
 Authentication, providers, and permissions come from your normal Maki config. Set up [providers](/docs/providers/) first and ACP sessions just work.

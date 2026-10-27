@@ -20,6 +20,7 @@ use crate::retry::RetryPolicy;
 pub(crate) mod anthropic;
 pub(crate) mod aperture;
 pub(crate) mod catalog;
+pub(crate) mod claude_code;
 pub(crate) mod codec;
 pub(crate) mod copilot;
 pub mod custom;
