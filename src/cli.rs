@@ -41,7 +41,7 @@ pub struct Cli {
     #[arg(long = "image", value_name = "PATH")]
     pub images: Vec<PathBuf>,
 
-    /// Model spec (provider/model-id). Defaults to last used model, or claude-opus-4-6
+    /// Model spec (provider/model-id). Defaults to last used model, then configured default_model, then auto-detected
     #[arg(short, long)]
     pub model: Option<String>,
 
