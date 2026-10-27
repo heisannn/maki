@@ -201,7 +201,7 @@ notify = { version = "9.0.0-rc.5", default-features = false, features = ["flume"
 notify-rust = "4.18.1"
 serde_yaml = "0.9"
 shell-words = "1"
-agent-client-protocol-schema = "1.10"
+agent-client-protocol-schema = { version = "1.10", features = ["unstable_session_fork"] }
 wait-timeout = "0.2"
 inventory = "0.3"
 

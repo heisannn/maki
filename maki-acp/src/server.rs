@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use agent_client_protocol_schema::v1::{
     AgentNotification, AgentRequest, AgentResponse, AvailableCommandsUpdate, ConfigOptionUpdate,
-    ContentBlock, CurrentModeUpdate, EmbeddedResourceResource, Error as AcpError, ImageContent,
-    InitializeRequest, JsonRpcMessage, ListSessionsRequest, ListSessionsResponse,
+    ContentBlock, CurrentModeUpdate, EmbeddedResourceResource, Error as AcpError,
+    ForkSessionRequest, ImageContent, InitializeRequest, JsonRpcMessage, ListSessionsRequest, ListSessionsResponse,
     LoadSessionRequest, McpServer, NewSessionRequest, Notification, PromptRequest, PromptResponse,
     Request, RequestId, RequestPermissionRequest, RequestPermissionResponse, Response,
     SessionConfigOption, SessionConfigOptionValue, SessionId, SessionInfo, SessionModeId,
@@ -285,6 +285,7 @@ async fn handle_request(
         }
         "session/new" => new_session(srv, raw, params).await,
         "session/load" => load_session(srv, raw, params).await,
+        "session/fork" => fork_session(srv, raw, params).await,
         "session/list" => list_sessions(raw, &params.storage).await,
         "session/prompt" => match handle_prompt(srv, raw, &id) {
             Ok(()) => return,
@@ -296,7 +297,8 @@ async fn handle_request(
     };
     // Sent after the response, so the client already knows the session id the
     // update names.
-    let started = result.is_ok() && matches!(method, "session/new" | "session/load");
+    let started =
+        result.is_ok() && matches!(method, "session/new" | "session/load" | "session/fork");
     srv.respond(id, result);
     if started {
         announce_commands(srv);
@@ -418,6 +420,46 @@ async fn load_session(
     maki_otel::emit::session_started(maki_otel::emit::START_RESUME, Some(started.as_str()));
     let resp = methods::load_session_response().config_options(current_config_options(srv).await);
     Ok(AgentResponse::LoadSessionResponse(resp))
+}
+
+/// `session/fork`: a copy of a stored session under a new id, like
+/// `--fork-session`. The source is read without a claim, since the client
+/// usually still runs it in another process. Nothing is replayed: the client
+/// already shows the conversation it forked.
+async fn fork_session(
+    srv: &mut Server,
+    raw: &Value,
+    params: &AcpParams,
+) -> Result<AgentResponse, AcpError> {
+    let req: ForkSessionRequest = parse_params(raw)?;
+    let source: SessionRef = req
+        .session_id
+        .0
+        .parse()
+        .map_err(|_| AcpError::resource_not_found(Some(req.session_id.0.to_string())))?;
+    let (forked, claim) = fork_history(&params.storage, source.id(), &req.cwd)?;
+    close_session(srv, SessionEndReason::Replaced).await;
+    let project_config = trusted_project_config(
+        &req.cwd,
+        &params.storage,
+        params.trust_mode,
+        &params.trust_policy,
+    );
+    let mcp = start_mcp(&req.cwd, &req.mcp_servers, project_config.clone()).await;
+    let session_ref = start_session(
+        srv,
+        params,
+        req.cwd,
+        Resumed::stored(SessionRef::from(claim.id()), forked),
+        claim,
+        mcp,
+        project_config,
+        None,
+    );
+    maki_otel::emit::session_started(maki_otel::emit::START_FRESH, Some(session_ref.as_str()));
+    let resp = methods::fork_session_response(session_ref.as_str())
+        .config_options(current_config_options(srv).await);
+    Ok(AgentResponse::ForkSessionResponse(resp))
 }
 
 /// `session/list`: stored sessions, newest first. Reads the store, not
@@ -747,6 +789,24 @@ fn claim_history(
     let (session, claim) = StoredSession::claim_and_load(session_id, storage)
         .map_err(|e| load_error(e, session_id))?;
     Ok((Restored::from(session), claim))
+}
+
+/// The fork is written before its run starts, so it exists under the id the
+/// client is handed even if that run dies early.
+fn fork_history(
+    storage: &StateDir,
+    source: MakiId,
+    cwd: &Path,
+) -> Result<(StoredSession, SessionClaim), AcpError> {
+    let original = StoredSession::read_only(source, storage).map_err(|e| load_error(e, source))?;
+    let claim = SessionClaim::fresh(storage);
+    let mut forked = original
+        .fork(claim.id(), &cwd.to_string_lossy(), storage)
+        .map_err(|e| AcpError::internal_error().data(json_str(&e)))?;
+    forked
+        .save(&claim, storage)
+        .map_err(|e| AcpError::internal_error().data(json_str(&e)))?;
+    Ok((forked, claim))
 }
 
 /// [`claim_history`] for the session this server already holds.
@@ -2586,6 +2646,42 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let dir = StateDir::from_path(tmp.path().to_path_buf());
         let err = claim_history(&dir, MakiId::generate()).unwrap_err();
+        assert_eq!(err.code, AcpError::resource_not_found(None).code);
+    }
+
+    /// The client forks a session its own maki still runs, so the copy must
+    /// not need that run's claim, and must leave the original as it was.
+    #[test]
+    fn fork_copies_a_session_another_maki_holds() {
+        let tmp = TempDir::new().unwrap();
+        let dir = StateDir::from_path(tmp.path().to_path_buf());
+        let messages = vec![Message::user("rename foo to bar".into())];
+        let mut original: Session<Message, TokenUsage, maki_agent::ToolOutput> =
+            Session::new(SELECTED_SPEC, "/project");
+        original.replace_messages(messages.clone());
+        let held = SessionClaim::acquire(original.id, &dir).unwrap();
+        original.save(&held, &dir).unwrap();
+
+        let (forked, claim) = fork_history(&dir, original.id, Path::new("/fork")).unwrap();
+
+        assert_ne!(claim.id(), original.id);
+        assert_eq!(forked.cwd, "/fork");
+        let on_disk = StoredSession::read_only(claim.id(), &dir).unwrap();
+        assert_eq!(
+            serde_json::to_value(on_disk.messages()).unwrap(),
+            serde_json::to_value(&messages).unwrap()
+        );
+        assert_eq!(
+            StoredSession::read_only(original.id, &dir).unwrap().cwd,
+            "/project"
+        );
+    }
+
+    #[test]
+    fn fork_missing_session_is_resource_not_found() {
+        let tmp = TempDir::new().unwrap();
+        let dir = StateDir::from_path(tmp.path().to_path_buf());
+        let err = fork_history(&dir, MakiId::generate(), Path::new("/fork")).unwrap_err();
         assert_eq!(err.code, AcpError::resource_not_found(None).code);
     }
 

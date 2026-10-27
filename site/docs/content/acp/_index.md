@@ -37,6 +37,7 @@ The `model` value is a `provider/model-id` spec, same format as `maki --model`.
 
 - **Sessions persist.** Loading a session replays the full conversation in the editor, so you can resume where you left off.
 - **Resume picker.** Editors can list this project's stored sessions, newest first, to resume an old transcript instead of starting a blank one.
+- **Forks.** Editors can fork a session into a new one with the same history, for example to start a side chat. The original session does not change.
 - **Model switching.** Pick a model from the editor's dropdown, mid-session. All configured providers show up. Providers that list their models over the wire (OpenRouter and friends) are discovered in the background, so the dropdown keeps filling up for a moment after the session starts, one provider at a time.
 - **Thinking.** Pick the thinking level (off, or minimal through max) from the editor, mid-session. It starts at your `always_thinking` config, or off.
 - **Modes.** Switch between build (full access) and plan (plan-file writes only) from the editor.

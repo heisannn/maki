@@ -2,10 +2,11 @@ use std::iter;
 
 use agent_client_protocol_schema::ProtocolVersion;
 use agent_client_protocol_schema::v1::{
-    AgentCapabilities, Implementation, InitializeResponse, LoadSessionResponse, McpCapabilities,
-    NewSessionResponse, PromptCapabilities, SessionCapabilities, SessionConfigOption,
-    SessionConfigOptionCategory, SessionConfigSelectOption, SessionListCapabilities, SessionMode,
-    SessionModeId, SessionModeState,
+    AgentCapabilities, ForkSessionResponse, Implementation, InitializeResponse, LoadSessionResponse,
+    McpCapabilities, NewSessionResponse, PromptCapabilities, SessionCapabilities,
+    SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption,
+    SessionForkCapabilities, SessionListCapabilities, SessionMode, SessionModeId,
+    SessionModeState,
 };
 use maki_providers::ThinkingConfig;
 use maki_providers::model::Model;
@@ -27,7 +28,9 @@ pub fn initialize_response() -> InitializeResponse {
                 .prompt_capabilities(PromptCapabilities::new().image(true).embedded_context(true))
                 .mcp_capabilities(McpCapabilities::new().http(true))
                 .session_capabilities(
-                    SessionCapabilities::new().list(SessionListCapabilities::new()),
+                    SessionCapabilities::new()
+                        .list(SessionListCapabilities::new())
+                        .fork(SessionForkCapabilities::new()),
                 ),
         )
         .auth_methods(vec![])
@@ -50,6 +53,10 @@ pub fn new_session_response(session_id: &str) -> NewSessionResponse {
 
 pub fn load_session_response() -> LoadSessionResponse {
     LoadSessionResponse::new().modes(mode_state(MODE_BUILD))
+}
+
+pub fn fork_session_response(session_id: &str) -> ForkSessionResponse {
+    ForkSessionResponse::new(session_id.to_string()).modes(mode_state(MODE_BUILD))
 }
 
 pub fn model_config_option(current: &str, specs: &[String]) -> SessionConfigOption {
