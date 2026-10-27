@@ -18,7 +18,7 @@ use agent_client_protocol_schema::v1::{
     TextContent,
 };
 use color_eyre::eyre::Context;
-use flume::{Sender, WeakSender};
+use flume::{Receiver, Sender, WeakSender};
 use maki_agent::command::{CustomCommand, discover_commands};
 use maki_agent::headless::{self, InteractiveHandle, InteractiveInput, InteractiveParams};
 use maki_agent::mcp::config::{RawHttpFields, RawStdioFields, RawTransport};
@@ -34,7 +34,9 @@ use maki_agent::{
 use maki_config::project::{self, TrustAnswer, TrustMode, policy_grant};
 use maki_config::{MAX_SERVER_NAME_LEN, ModelPolicy, ProjectConfig, SessionDefaults, TrustConfig};
 use maki_providers::model::Model;
+use maki_providers::model_registry;
 use maki_providers::provider::{available_model_specs, fetch_all_models};
+use maki_providers::spec::ProviderRegistry;
 use maki_providers::{add_cost, settle_session};
 use maki_storage::StateDir;
 use maki_storage::id::{MakiId, SessionRef};
@@ -58,6 +60,7 @@ const RESTORED_FAST: bool = false;
 /// already says which session and why.
 const SESSION_BUSY_CODE: i32 = -32000;
 const LIVE_OUTPUT_POLL: Duration = Duration::from_millis(200);
+const DISCOVERY_WAIT: Duration = Duration::from_secs(10);
 
 /// Ids come from here and are never reused, so a late answer for a closed
 /// session cannot match a request of the session that replaced it.
@@ -102,6 +105,8 @@ struct SessionState {
 struct Server {
     out_tx: Sender<Value>,
     model_specs: Vec<String>,
+    /// One message per discovery batch, disconnected once discovery is done.
+    discovery_progress: Receiver<()>,
     model_policy: Arc<ModelPolicy>,
     client_elicits_form: bool,
     defaults: SessionDefaults,
@@ -134,9 +139,11 @@ pub async fn serve(params: AcpParams) -> color_eyre::Result<()> {
         }
     });
 
+    let (progress_tx, discovery_progress) = flume::unbounded();
     let mut server = Server {
         out_tx,
         model_specs: available_model_specs(&params.model_policy),
+        discovery_progress,
         model_policy: Arc::clone(&params.model_policy),
         client_elicits_form: false,
         defaults: params.defaults,
@@ -146,7 +153,11 @@ pub async fn serve(params: AcpParams) -> color_eyre::Result<()> {
 
     let (in_tx, in_rx) = flume::unbounded::<Incoming>();
     // Weak, so a discovery still in flight cannot keep the loop alive once stdin closes.
-    discover_models(Arc::clone(&params.model_policy), in_tx.downgrade());
+    discover_models(
+        Arc::clone(&params.model_policy),
+        in_tx.downgrade(),
+        progress_tx,
+    );
     let reader_task = smol::spawn(read_stdin(in_tx));
 
     while let Ok(incoming) = in_rx.recv_async().await {
@@ -184,7 +195,7 @@ async fn read_stdin(tx: Sender<Incoming>) -> std::io::Result<()> {
 /// in the background. Each batch leaves the moment it lands: the slowest source
 /// is a cold catalog download, and a provider the client could already pick from
 /// should not wait behind it.
-fn discover_models(policy: Arc<ModelPolicy>, tx: WeakSender<Incoming>) {
+fn discover_models(policy: Arc<ModelPolicy>, tx: WeakSender<Incoming>, progress: Sender<()>) {
     smol::spawn(async move {
         fetch_all_models(
             &policy,
@@ -192,6 +203,7 @@ fn discover_models(policy: Arc<ModelPolicy>, tx: WeakSender<Incoming>) {
                 if let Some(tx) = tx.upgrade() {
                     let _ = tx.send(Incoming::Models(batch.models));
                 }
+                let _ = progress.send(());
             },
             None,
         )
@@ -279,7 +291,7 @@ async fn handle_request(
             Err(e) => Err(e),
         },
         "session/set_mode" => handle_set_mode(srv, raw),
-        "session/set_config_option" => handle_set_config(srv, raw),
+        "session/set_config_option" => handle_set_config(srv, raw).await,
         _ => Err(AcpError::method_not_found()),
     };
     // Sent after the response, so the client already knows the session id the
@@ -329,7 +341,7 @@ async fn new_session(
     );
     maki_otel::emit::session_started(maki_otel::emit::START_FRESH, Some(session_ref.as_str()));
     let resp = methods::new_session_response(session_ref.as_str())
-        .config_options(current_config_options(srv));
+        .config_options(current_config_options(srv).await);
     Ok(AgentResponse::NewSessionResponse(resp))
 }
 
@@ -404,7 +416,7 @@ async fn load_session(
         restored_cost,
     );
     maki_otel::emit::session_started(maki_otel::emit::START_RESUME, Some(started.as_str()));
-    let resp = methods::load_session_response().config_options(current_config_options(srv));
+    let resp = methods::load_session_response().config_options(current_config_options(srv).await);
     Ok(AgentResponse::LoadSessionResponse(resp))
 }
 
@@ -830,7 +842,7 @@ fn handle_set_mode(srv: &mut Server, raw: &Value) -> Result<AgentResponse, AcpEr
     ))
 }
 
-fn handle_set_config(srv: &mut Server, raw: &Value) -> Result<AgentResponse, AcpError> {
+async fn handle_set_config(srv: &mut Server, raw: &Value) -> Result<AgentResponse, AcpError> {
     let req: SetSessionConfigOptionRequest = parse_params(raw)?;
     let SessionConfigOptionValue::ValueId { value } = req.value else {
         return Err(AcpError::invalid_params().data(json_str(&"config value must be a value id")));
@@ -845,7 +857,7 @@ fn handle_set_config(srv: &mut Server, raw: &Value) -> Result<AgentResponse, Acp
         }
     }
     Ok(AgentResponse::SetSessionConfigOptionResponse(
-        SetSessionConfigOptionResponse::new(current_config_options(srv)),
+        SetSessionConfigOptionResponse::new(current_config_options(srv).await),
     ))
 }
 
@@ -873,12 +885,39 @@ fn set_thinking(srv: &mut Server, value: &str) -> Result<(), AcpError> {
     Ok(())
 }
 
-fn current_config_options(srv: &Server) -> Vec<SessionConfigOption> {
-    match &srv.session {
-        Some(session) => {
-            methods::config_options(&session.current_model, &srv.model_specs, session.thinking)
+/// Clients like bb read a model's thinking levels once, from the response that
+/// selects it, and providers like Copilot only report those levels through
+/// discovery. So the response waits for the model's provider to be discovered.
+async fn current_config_options(srv: &Server) -> Vec<SessionConfigOption> {
+    let Some(session) = &srv.session else {
+        return Vec::new();
+    };
+    await_discovery(&srv.discovery_progress, &session.current_model).await;
+    methods::config_options(&session.current_model, &srv.model_specs, session.thinking)
+}
+
+async fn await_discovery(progress: &Receiver<()>, spec: &str) {
+    let Some(slug) = Model::from_spec(spec)
+        .ok()
+        .and_then(|model| ProviderRegistry::for_slug(&model.provider))
+        .map(|provider| provider.slug)
+    else {
+        return;
+    };
+    let mut deadline = Timer::after(DISCOVERY_WAIT);
+    while !model_registry::discovery_complete(slug) {
+        let progressed = future::or(async { progress.recv_async().await.is_ok() }, async {
+            (&mut deadline).await;
+            false
+        })
+        .await;
+        if !progressed {
+            warn!(
+                spec,
+                "model discovery did not finish, thinking levels may be missing"
+            );
+            return;
         }
-        None => Vec::new(),
     }
 }
 
@@ -1238,6 +1277,7 @@ mod tests {
     };
     use maki_config::project::TrustQuestion;
     use maki_config::{AgentConfig, Effect, ToolKey, TrustFileConfig};
+    use maki_providers::model::ModelInfo;
     use maki_providers::{ContentBlock as MsgBlock, Message, Role, Timeouts, TokenUsage};
     use maki_storage::StateDir;
     use maki_storage::sessions::{Effort, Session, StoredTokenUsage};
@@ -1252,6 +1292,8 @@ mod tests {
     const DISCOVERED_SPEC: &str = "openrouter/discovered-model";
     const OFFLINE_SPEC: &str = "openai/gpt-5";
     const SELECTED_SPEC: &str = "openai/gpt-5.6-sol";
+    const COPILOT_SLUG: &str = "copilot";
+    const COPILOT_MODEL_ID: &str = "claude-opus-4.7";
     const FAILED_LOAD_KEEPS_SESSION: &str = "a load that failed must not close the running session";
     /// Neither resolves in the price tables, so nothing can re-price a restored
     /// session back onto the recorded number by luck.
@@ -1459,16 +1501,43 @@ mod tests {
         })
     }
 
+    /// Copilot's offline row says nothing about thinking, so without waiting
+    /// the response that selects the model would carry no thinking option.
+    #[test]
+    fn config_options_wait_for_the_model_provider_discovery() {
+        let (mut srv, _answers, _out) = test_server();
+        let (progress_tx, progress) = flume::unbounded();
+        srv.discovery_progress = progress;
+        let discovery = std::thread::spawn(move || {
+            model_registry::set_known_models(
+                COPILOT_SLUG,
+                vec![ModelInfo {
+                    id: COPILOT_MODEL_ID.to_owned(),
+                    supports_thinking: Some(true),
+                    ..ModelInfo::default()
+                }],
+            );
+            progress_tx.send(()).unwrap();
+        });
+
+        srv.session.as_mut().unwrap().current_model = format!("{COPILOT_SLUG}/{COPILOT_MODEL_ID}");
+        let options = smol::block_on(current_config_options(&srv));
+        discovery.join().unwrap();
+
+        let ids: Vec<&str> = options.iter().map(|option| option.id.0.as_ref()).collect();
+        assert_eq!(ids, [methods::MODEL_CONFIG_ID, methods::THINKING_CONFIG_ID]);
+    }
+
     #[test_case("high", Some(StoredThinking::Effort { level: Effort::High }) ; "effort_level")]
     #[test_case("adaptive", Some(StoredThinking::Adaptive) ; "adaptive")]
     #[test_case("4096", Some(StoredThinking::Budget { tokens: 4096 }) ; "token_budget")]
     #[test_case("bogus", None ; "unknown_value_is_rejected")]
     fn set_thinking_config(value: &str, expected: Option<StoredThinking>) {
         let (mut srv, _answers, _out) = test_server();
-        let result = handle_set_config(
+        let result = smol::block_on(handle_set_config(
             &mut srv,
             &set_config_request(methods::THINKING_CONFIG_ID, value),
-        );
+        ));
         let thinking = srv.session.as_ref().unwrap().thinking;
         match expected {
             Some(expected) => {
@@ -1512,6 +1581,7 @@ mod tests {
         let server = Server {
             out_tx,
             model_specs: Vec::new(),
+            discovery_progress: flume::unbounded().1,
             model_policy: Arc::new(ModelPolicy::default()),
             client_elicits_form: false,
             defaults: SessionDefaults::default(),
