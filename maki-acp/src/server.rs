@@ -2272,6 +2272,7 @@ mod tests {
         let update = &streamed["params"]["update"];
         assert_eq!(update["sessionUpdate"], "tool_call_update");
         assert_eq!(update["toolCallId"], LIVE_TOOL_ID);
+        assert_eq!(update["status"], "in_progress");
         assert!(
             update["content"][0]["content"]["text"]
                 .as_str()

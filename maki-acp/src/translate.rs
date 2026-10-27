@@ -303,10 +303,14 @@ fn done_locations(event: &ToolDoneEvent, cwd: &Path, home: Option<&Path>) -> Vec
     vec![location(resolved, None)]
 }
 
+/// Carries `in_progress` on every chunk: a client such as bb treats only an
+/// update that says so as a live output snapshot of a running command.
 pub fn tool_output(id: &str, content: &str) -> SessionUpdate {
-    let fields = ToolCallUpdateFields::new().content(vec![ToolCallContent::Content(Content::new(
-        ContentBlock::Text(TextContent::new(fenced(content))),
-    ))]);
+    let fields = ToolCallUpdateFields::new()
+        .status(ToolCallStatus::InProgress)
+        .content(vec![ToolCallContent::Content(Content::new(
+            ContentBlock::Text(TextContent::new(fenced(content))),
+        ))]);
     SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
         ToolCallId::from(id.to_string()),
         fields,
