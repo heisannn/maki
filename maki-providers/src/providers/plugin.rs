@@ -2806,7 +2806,10 @@ mod tests {
                 assert_eq!(model.effective_thinking_fields().is_some(), uses_fields);
                 let options = model.thinking_options();
                 assert!(!options.is_empty());
-                assert_eq!(options.iter().any(|o| o.name == "off"), !required);
+                assert_eq!(
+                    options.iter().any(|o| o.name == "off"),
+                    !required && model.effort_ladder().is_none()
+                );
                 let requested = ThinkingConfig::Effort(Effort::Low);
                 assert_eq!(requested.clamped(&model), requested);
                 if uses_fields {

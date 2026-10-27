@@ -32,6 +32,13 @@ const ENV_VAR: &str = "GH_COPILOT_TOKEN";
 const DEFAULT_API_ENDPOINT: &str = "https://api.githubcopilot.com";
 const DEFAULT_MODEL: &str = "copilot/gpt-5.6-terra";
 const LOGIN_URL: &str = "https://github.com/settings/copilot";
+const EFFORT_LADDER: &[Effort] = &[
+    Effort::Low,
+    Effort::Medium,
+    Effort::High,
+    Effort::XHigh,
+    Effort::Max,
+];
 /// Prose, not a value: the real endpoint is discovered over GraphQL.
 const DOC_API_URL: &str =
     "https://api.githubcopilot.com (or GraphQL-discovered Copilot API endpoint)";
@@ -49,7 +56,7 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     supports_deferred_tools: false,
     adaptive_effort,
     thinking_fields_fallback: |_| None,
-    effort_ladder: None,
+    effort_ladder: Some(EFFORT_LADDER),
     accepts_arbitrary_models: true,
     fallback_max_output: Some(100_000),
     fallback_context_window: 200_000,
