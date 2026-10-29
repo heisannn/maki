@@ -1,8 +1,56 @@
+#[cfg(test)]
+pub(crate) mod fuzz;
+mod marks;
+mod rules;
+mod syntax;
+#[cfg(test)]
+pub(crate) mod test_support;
+
+use std::cell::Cell;
 use std::collections::VecDeque;
+use std::mem;
+use std::ops::{Range, RangeInclusive};
+use std::sync::Arc;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use maki_lua::{InputMarks, PluginReach, SyntaxInput, TextEdit};
 
+use crate::components::input::sent_text;
 use crate::highlight::TAB_SPACES;
+
+#[cfg(any(test, feature = "bench"))]
+pub use self::marks::Decoration;
+#[cfg(test)]
+pub use self::marks::Reveal;
+pub use self::marks::{Concealed, Mark, Marks, Placed, VirtTextPos};
+use self::rules::RuleMarks;
+pub use self::rules::RuleSet;
+use self::syntax::{SyntaxMarks, edit_since};
+
+/// How many versions back a reader can fall and still catch up through the
+/// log. A reader that catches up every frame never falls far behind, and one
+/// that falls off the end only pays for a rebuild from the whole value. A
+/// plugin plans its edit a few keystrokes back at most, and a whole paste is
+/// one version, so this leaves it plenty of room too.
+const CHANGE_LOG_LEN: u64 = 256;
+
+/// A step keeps the text its edit removed, so a long session of big deletes
+/// would pile up forever without a cap. Nobody presses undo 64 times in a row.
+const MAX_UNDO: usize = 64;
+
+const NOTHING_TO_APPLY_ERR: &str = "nothing to apply: no edits, cursor, anchor or marks";
+const PAST_END_ERR: &str = "is past the end of the input";
+const INSIDE_CHAR_ERR: &str = "is inside a character";
+const OVERLAPPING_EDITS_ERR: &str = "edits overlap or start at the same offset";
+const VERSION_TOO_OLD_ERR: &str = "the input changed too many times to map the offsets";
+pub(crate) const EDIT_CONFLICT_ERR: &str =
+    "the input changed at or next to an edited range since the edit was planned";
+pub(crate) const INPUT_REPLACED_ERR: &str =
+    "the input was replaced (history, draft, $EDITOR or submit) since the offsets were read";
+pub(crate) const CURSOR_CONFLICT_ERR: &str =
+    "the cursor or anchor lands inside text changed since the edit was planned";
+const UNCLEAN_TEXT_ERR: &str = "edit text has tabs, carriage returns or control characters \
+                                that would shift its offsets, so clean the text first";
 
 pub fn is_newline_key(key: &KeyEvent) -> bool {
     (matches!(key.code, KeyCode::Enter)
@@ -21,58 +69,362 @@ pub enum EditResult {
     Changed,
 }
 
-pub struct TextBuffer {
-    lines: Vec<String>,
-    raw_x: usize,
-    cursor_y: usize,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChangeKind {
+    /// Typing, pasting and plugin writes. The text around the change did not
+    /// move, so an offset outside it can simply be shifted past it.
+    Edit,
+    /// A whole prompt swapped in: history recall, a restored draft, `$EDITOR`,
+    /// submit. Even when the diff is small or empty, an offset from before it
+    /// points into a different prompt.
+    Replace,
+}
+
+/// `start..old_end` of the value before it became `start..new_end`, and lines
+/// `start_line..=old_end_line` became `start_line..=new_end_line`. Only
+/// offsets, so a big paste costs the log as much as one keystroke.
+///
+/// A version that edits several ranges logs one change per range, all with
+/// that version, in the order they were applied. Each one counts in the value
+/// the ones before it left, so a position is mapped by walking them in order,
+/// and the text between the ranges is never mistaken for changed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Change {
     version: u64,
-    undo: VecDeque<Snapshot>,
-    last_edit: Option<LastEdit>,
+    pub start: usize,
+    pub old_end: usize,
+    pub new_end: usize,
+    pub start_line: usize,
+    pub old_end_line: usize,
+    pub new_end_line: usize,
+    pub kind: ChangeKind,
 }
 
-/// The buffer before one undoable step. Restoring also restores the cursor,
-/// because an undo that leaves the caret somewhere else is a search for where
-/// the text went.
-#[derive(Clone)]
-struct Snapshot {
-    lines: Vec<String>,
-    raw_x: usize,
-    cursor_y: usize,
+impl Change {
+    /// Where {pos} lands after this change, read as a delete followed by an
+    /// insert: a position inside the removed text falls to where it started,
+    /// and a position where text is inserted ends up after that text when
+    /// {after}.
+    pub fn map_pos(&self, pos: usize, after: bool) -> usize {
+        if pos < self.start {
+            pos
+        } else if pos > self.old_end {
+            pos - self.old_end + self.new_end
+        } else if after {
+            self.new_end
+        } else {
+            self.start
+        }
+    }
+
+    /// Where {bytes} lands after this change, grown over text inserted at
+    /// either end.
+    pub fn map_range(&self, bytes: Range<usize>) -> Range<usize> {
+        self.map_pos(bytes.start, false)..self.map_pos(bytes.end, true)
+    }
+
+    /// This change as it reads once {shrunk} bytes before it became {grown}
+    /// bytes. Only its offsets move, since nothing maps a line through it.
+    fn past(&self, grown: usize, shrunk: usize) -> Self {
+        let at = |pos: usize| pos + grown - shrunk;
+        Self {
+            start: at(self.start),
+            old_end: at(self.old_end),
+            new_end: at(self.new_end),
+            ..self.clone()
+        }
+    }
 }
 
-/// What one user action does to the text, for grouping undo steps. A run of
-/// typing or of backspaces rewinds a word at a time. Anything else is a step
-/// of its own: a paste, a word kill or a plugin write is already a step the
-/// user meant.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum EditKind {
+/// Which way the cursor leaves a range it may not stop inside.
+#[derive(Clone, Copy)]
+enum Toward {
+    Start,
+    End,
+    Nearest,
+}
+
+/// Plain typing and plain backspaces run together into one step per word. A
+/// paste, a word kill or a plugin write never joins a run, because each one is
+/// already a step the user meant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EditGroup {
     Typing,
     Deleting,
-    Other,
 }
 
-/// Where the last recorded edit left the buffer. The next edit joins its step
-/// only when it is the same kind, starts right there, and nothing else wrote
-/// the value in between.
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct LastEdit {
-    kind: EditKind,
+/// Puts {text} back over `start..end` to undo one splice. It keeps only what
+/// the splice removed, so typing and pasting store no text at all and a step
+/// never costs the whole prompt.
+struct Inverse {
+    start: usize,
+    end: usize,
+    text: String,
+}
+
+impl Inverse {
+    /// Whether {text} already reads what this puts back, as after writing
+    /// the same text over itself, which is no change at all.
+    fn restores(&self, text: &str) -> bool {
+        text[self.start..self.end] == self.text
+    }
+}
+
+struct UndoStep {
+    /// Oldest first. Undo walks them back to front, because each range points
+    /// into the text the edits before it left behind.
+    inverses: Vec<Inverse>,
+    /// Undo puts the caret back here, or the user goes looking for the text
+    /// that just changed.
+    cursor: usize,
+    /// And the selection, so undoing a wrap selects the text it wrapped.
+    anchor: Option<usize>,
+    /// And who had written the text, so undoing past a clear brings a
+    /// plugin's line back as the plugin's.
+    writers: Writers,
+    group: Option<EditGroup>,
+}
+
+impl UndoStep {
+    /// Folds {next} into this step when it continues the same run, a character
+    /// typed where the last one ended or a backspace right before the last one.
+    /// Only position counts, so moving the cursor away and back keeps the run.
+    /// A run breaks after whitespace, which makes undo go a word at a time.
+    fn absorb(&mut self, next: &UndoStep, text: &str) -> bool {
+        let (Some(group), [last], [new]) = (self.group, &mut self.inverses[..], &next.inverses[..])
+        else {
+            return false;
+        };
+        if next.group != Some(group) {
+            return false;
+        }
+        match group {
+            // A key typed over a selection also removes the selected text,
+            // and a run only grows at its end with no room to keep it. So
+            // that key starts a new run, or undo would lose the text.
+            EditGroup::Typing => {
+                if new.start != last.end
+                    || !new.text.is_empty()
+                    || text[..new.start].ends_with(char::is_whitespace)
+                {
+                    return false;
+                }
+                last.end = new.end;
+            }
+            EditGroup::Deleting => {
+                if new.start + new.text.len() != last.start
+                    || new.text.starts_with(char::is_whitespace)
+                {
+                    return false;
+                }
+                last.start = new.start;
+                last.end = new.end;
+                last.text.insert_str(0, &new.text);
+            }
+        }
+        true
+    }
+}
+
+#[derive(Default)]
+struct UndoHistory {
+    steps: VecDeque<UndoStep>,
+    /// What undo took back, newest last, for redo. Undo and redo only move
+    /// steps between the two, so together they never pass [`MAX_UNDO`].
+    undone: Vec<UndoStep>,
+    /// The step the action in progress records into.
+    open: Option<UndoStep>,
+}
+
+impl UndoHistory {
+    /// An action that changed nothing leaves no step, so every undo rewinds
+    /// something the user can see. One that did change something forgets
+    /// what redo could bring back, whose ranges point into the text from
+    /// before it.
+    fn push(&mut self, step: UndoStep, text: &str) {
+        // Only the newest inverse is sure to point into {text}. When it holds,
+        // the text before it was {text} too, so the one before can be checked
+        // next, and all of them holding means the step changed nothing.
+        if step
+            .inverses
+            .iter()
+            .rev()
+            .all(|inverse| inverse.restores(text))
+        {
+            return;
+        }
+        self.undone.clear();
+        if let Some(last) = self.steps.back_mut()
+            && last.absorb(&step, text)
+        {
+            return;
+        }
+        self.keep(step);
+    }
+
+    fn keep(&mut self, step: UndoStep) {
+        if self.steps.len() == MAX_UNDO {
+            self.steps.pop_front();
+        }
+        self.steps.push_back(step);
+    }
+}
+
+/// The plugins that changed a prompt's text, each held to the grants it had
+/// in all of its changes. A user edit inside the text takes nobody out, so
+/// retyping a character never makes a plugin's line the user's. Only a blank
+/// text, a user edit over all of it or another prompt starts the set over.
+#[derive(Clone, Default)]
+pub struct Writers(Arc<[PluginReach]>);
+
+impl Writers {
+    /// One entry per plugin. A write with grants the entry lacks, as inside
+    /// an action another plugin ran, keeps only what both hold.
+    fn add(&mut self, writer: &PluginReach) {
+        match self
+            .0
+            .iter()
+            .position(|held| held.owner() == writer.owner())
+        {
+            Some(index) if writer.first_missing(&self.0[index]).is_none() => {}
+            Some(index) => {
+                let mut held = self.0.to_vec();
+                held[index] = held[index].intersect(writer);
+                self.0 = held.into();
+            }
+            None => self.0 = self.0.iter().cloned().chain([writer.clone()]).collect(),
+        }
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &PluginReach> {
+        self.0.iter()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+/// One prompt the input can hold: its text, the marks plugins placed on it
+/// and the plugins that wrote it. They only make sense on that text, so a
+/// prompt put away keeps them and brings them back when it returns.
+#[derive(Default)]
+pub struct Prompt {
+    pub text: String,
+    pub marks: Marks,
+    pub writers: Writers,
+}
+
+pub struct TextBuffer {
+    text: String,
+    /// Byte offset where each line starts. An empty value is still one empty
+    /// line, so this always holds at least the first 0 and
+    /// `line_count() - 1` never underflows.
+    line_starts: Vec<usize>,
+    raw_x: usize,
     cursor_y: usize,
-    x: usize,
+    /// [`Self::cursor_byte`] at `(cursor_y, raw_x)`, which every tick and
+    /// frame asks for and which costs a scan of the line. A splice clears it.
+    cursor_cache: Cell<Option<((usize, usize), usize)>>,
+    /// The end of the selection the cursor is not on. `None` when nothing is
+    /// selected, and never the cursor itself. Only [`Self::select`] sets one,
+    /// moved out of atomic ranges, though a mark placed later may land around
+    /// it. Plain cursor moves leave it alone, so their callers drop it.
+    ///
+    /// Never mapped through a change: every change either takes the
+    /// selection or says where it goes, see [`Self::edit`] and
+    /// [`Self::apply_edits`].
+    anchor: Option<usize>,
     version: u64,
+    /// Oldest first, so `changes_since` can binary search for a version.
+    changes: VecDeque<Change>,
+    undo: UndoHistory,
+    /// Mapped in [`Self::splice`], so they move with every edit. A prompt
+    /// swapped in brings its own, see [`Self::swap_prompt`].
+    marks: Marks,
+    /// Never mapped like {marks}. [`Self::splice`] just forgets the lines it
+    /// changed, and they are matched again from the text.
+    rules: RuleMarks,
+    /// Never mapped either: each lookup maps the worker's last result
+    /// forward through {changes}.
+    syntax: SyntaxMarks,
+    /// Bumped when the marks change how wide a line is drawn in a way the
+    /// change log cannot point at: a mark with inline virtual text or a
+    /// conceal dropped far from the edit, another draft's marks swapped in,
+    /// conceals turned on or off, new rules.
+    decor_epoch: u64,
+    /// Shows the text under every conceal, for checking what is really sent.
+    raw: bool,
+    /// A plugin's change adds to it, see [`Self::written_by`]. A prompt
+    /// swapped in brings its own, and an undo step puts back the set it began
+    /// with.
+    writers: Writers,
 }
-
-/// Enough history for a long paste session typed over, and small enough that
-/// the buffer cannot grow without bound on a held key.
-const MAX_UNDO: usize = 64;
 
 /// Refuses an offset that splits a character. Rounding it would move an edit
 /// a plugin asked for onto text it never read.
-fn check_boundary(value: &str, what: &str, idx: usize) -> Result<(), String> {
-    if value.is_char_boundary(idx) {
+fn check_boundary(on_boundary: bool, what: &str, idx: usize) -> Result<(), String> {
+    if on_boundary {
         return Ok(());
     }
-    Err(format!("{what} {idx} is inside a character"))
+    Err(format!("{what} {idx} {INSIDE_CHAR_ERR}"))
+}
+
+/// {edits} are sorted by start. Two ranges sharing an offset are fine, one
+/// ending where the next starts, unless both start there: an insert next to
+/// another edit at the same offset could go on either side of it.
+fn check_ranges(edits: &[TextEdit]) -> Result<(), String> {
+    if let Some(edit) = edits.iter().find(|edit| edit.start > edit.stop) {
+        return Err(format!("start {} is past stop {}", edit.start, edit.stop));
+    }
+    match edits
+        .windows(2)
+        .find(|pair| pair[0].stop > pair[1].start || pair[0].start == pair[1].start)
+    {
+        Some([a, b]) => Err(format!(
+            "{OVERLAPPING_EDITS_ERR}: {}..{} and {}..{}",
+            a.start, a.stop, b.start, b.stop
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// An offset at an insertion lands after the inserted text, and one strictly
+/// inside replaced text has nowhere to go, which answers `None`.
+fn map_offset(changes: &[Change], mut at: usize) -> Option<usize> {
+    for change in changes {
+        if at >= change.old_end {
+            at = at + change.new_end - change.old_end;
+        } else if at > change.start {
+            return None;
+        }
+    }
+    Some(at)
+}
+
+/// Moves {marks} through {changes} the way the store moves its own, drops
+/// the ones that would not have made it, and checks the rest fit a value
+/// {len} bytes long whose char boundaries {on_boundary} answers. A reversed
+/// range is refused first, since mapping would quietly drop it.
+fn fit_marks(
+    changes: &[Change],
+    marks: &mut Vec<Mark>,
+    len: usize,
+    on_boundary: impl Fn(usize) -> bool,
+) -> Result<(), String> {
+    if let Some(mark) = marks.iter().find(|mark| mark.start > mark.end()) {
+        return Err(format!("start {} is past stop {}", mark.start, mark.end()));
+    }
+    marks.retain_mut(|mark| changes.iter().all(|change| marks::remap_mark(mark, change)));
+    for mark in marks.iter() {
+        let stop = mark.end();
+        if stop > len {
+            return Err(format!("stop {stop} {PAST_END_ERR} ({len})"));
+        }
+        check_boundary(on_boundary(mark.start), "start", mark.start)?;
+        check_boundary(on_boundary(stop), "stop", stop)?;
+    }
+    Ok(())
 }
 
 /// A tab is one column to the width math and [`TAB_SPACES`] wide to the
@@ -88,102 +440,207 @@ fn check_boundary(value: &str, what: &str, idx: usize) -> Result<(), String> {
 /// through [`TextBuffer::set_value`]: expanding the tabs of a tab-indented
 /// prompt on its way back in would send the model something the user never
 /// wrote.
-fn sanitize(text: &str) -> String {
-    text.replace('\t', TAB_SPACES)
-        .replace("\r\n", "\n")
-        .replace('\r', "\n")
+pub(crate) fn sanitize(text: &str) -> String {
+    normalize_line_endings(text)
+        .replace('\t', TAB_SPACES)
         .replace(|c: char| c.is_control() && c != '\n', "")
 }
 
+pub(crate) fn normalize_line_endings(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\r', "\n")
+}
+
+fn hull(a: Range<usize>, b: Range<usize>) -> Range<usize> {
+    a.start.min(b.start)..a.end.max(b.end)
+}
+
+fn line_starts_in(text: &str, offset: usize) -> impl Iterator<Item = usize> {
+    text.match_indices('\n').map(move |(i, _)| offset + i + 1)
+}
+
+/// The smallest span where {old} and {new} differ, as
+/// `(start, old_end, new_end)`. Two different characters can share their
+/// first or last byte, so both ends are pushed out to a character boundary
+/// before the span is sliced.
+fn changed_span(old: &str, new: &str) -> (usize, usize, usize) {
+    let prefix = old.bytes().zip(new.bytes()).take_while(|(a, b)| a == b);
+    let start = old.floor_char_boundary(prefix.count());
+    let max_suffix = old.len().min(new.len()) - start;
+    let suffix = old
+        .bytes()
+        .rev()
+        .zip(new.bytes().rev())
+        .take(max_suffix)
+        .take_while(|(a, b)| a == b)
+        .count();
+    let old_end = old.ceil_char_boundary(old.len() - suffix);
+    (start, old_end, new.len() - (old.len() - old_end))
+}
+
 impl TextBuffer {
-    pub fn new(input: String) -> Self {
-        let lines: Vec<String> = input.split('\n').map(str::to_string).collect();
+    pub fn new(text: String) -> Self {
+        let line_starts: Vec<usize> = [0].into_iter().chain(line_starts_in(&text, 0)).collect();
         Self {
-            lines,
+            rules: RuleMarks::new(Arc::default(), line_starts.len()),
+            syntax: SyntaxMarks::new(Arc::default()),
+            text,
+            line_starts,
             raw_x: 0,
             cursor_y: 0,
+            cursor_cache: Cell::default(),
+            anchor: None,
             version: 0,
-            undo: VecDeque::new(),
-            last_edit: None,
+            changes: VecDeque::new(),
+            undo: UndoHistory::default(),
+            marks: Marks::default(),
+            decor_epoch: 0,
+            raw: false,
+            writers: Writers::default(),
         }
     }
 
-    pub fn value(&self) -> String {
-        self.lines.join("\n")
+    pub fn value(&self) -> &str {
+        &self.text
     }
 
-    /// Replaces the whole value verbatim and parks the cursor at the start.
+    pub fn is_empty(&self) -> bool {
+        self.text.is_empty()
+    }
+
+    /// Puts {prompt} in place of the one here and hands that one back, text
+    /// and marks together. The text lands verbatim and the cursor goes to
+    /// the start.
     ///
-    /// The version keeps climbing across the swap, so a plugin holding a
-    /// version from before a history entry was recalled cannot mistake the
-    /// entry for the value it read.
-    pub fn set_value(&mut self, value: String) {
-        self.lines = value.split('\n').map(str::to_string).collect();
+    /// It is always one new version, logged as a [`ChangeKind::Replace`],
+    /// even when both prompts read the same. So an edit or marks planned on
+    /// the prompt put away are refused instead of landing on the one that
+    /// came in, and no mark is mapped across. Only the part of the text that
+    /// differs is spliced, so the lines both prompts share keep their layout.
+    ///
+    /// The undo history goes with the old prompt. Walking back across a
+    /// submit, a draft swap or a history recall would bring back a prompt the
+    /// user already put away. A step that is still open goes too, because its
+    /// ranges point into the old text.
+    pub fn swap_prompt(&mut self, prompt: Prompt) -> Prompt {
+        let old = Prompt {
+            text: self.text.clone(),
+            marks: mem::take(&mut self.marks),
+            writers: mem::replace(&mut self.writers, prompt.writers),
+        };
+        let (start, old_end, new_end) = changed_span(&self.text, &prompt.text);
+        self.splice(
+            start..old_end,
+            &prompt.text[start..new_end],
+            ChangeKind::Replace,
+        );
+        self.commit();
+        self.marks = prompt.marks;
+        let shapes_rows = |marks: &Marks| marks.shaping(0..=usize::MAX).next().is_some();
+        if shapes_rows(&old.marks) || shapes_rows(&self.marks) {
+            self.decor_epoch += 1;
+        }
+        self.undo = UndoHistory::default();
         self.raw_x = 0;
         self.cursor_y = 0;
-        self.version += 1;
-        self.clear_undo();
+        self.anchor = None;
+        old
     }
 
-    /// Runs one user action as one undo step, however many lines it touches,
-    /// so a multi-line paste rewinds in one press. Typing or backspacing on
-    /// from where the last edit of that kind stopped joins its step until a
-    /// new word starts, and an action that changed nothing leaves no step.
-    pub fn edit<R>(&mut self, kind: EditKind, apply: impl FnOnce(&mut Self) -> R) -> R {
-        let before = (!self.joins_last_edit(kind)).then(|| Snapshot {
-            lines: self.lines.clone(),
-            raw_x: self.raw_x,
-            cursor_y: self.cursor_y,
+    /// [`Self::swap_prompt`] with a prompt no plugin marked yet, dropping the
+    /// one put away.
+    pub fn set_value(&mut self, value: &str) {
+        self.swap_prompt(Prompt {
+            text: value.to_owned(),
+            ..Prompt::default()
         });
-        let out = apply(self);
-        if let Some(snap) = before {
-            if snap.lines == self.lines {
-                return out;
-            }
-            if self.undo.len() == MAX_UNDO {
-                self.undo.pop_front();
-            }
-            self.undo.push_back(snap);
+    }
+
+    /// Runs one action as one undo step, however many edits it makes. Called
+    /// inside another action, it joins that action's step.
+    pub fn undoable<R>(&mut self, action: impl FnOnce(&mut Self) -> R) -> R {
+        self.undo_step(None, action)
+    }
+
+    fn undo_step<R>(&mut self, group: Option<EditGroup>, action: impl FnOnce(&mut Self) -> R) -> R {
+        if self.undo.open.is_some() {
+            return action(self);
         }
-        self.last_edit = Some(self.edit_here(kind));
+        self.undo.open = Some(UndoStep {
+            inverses: Vec::new(),
+            cursor: self.cursor_byte(),
+            anchor: self.anchor,
+            writers: self.writers.clone(),
+            group,
+        });
+        let out = action(self);
+        // Gone when the action swapped the prompt, which drops it with the history.
+        if let Some(step) = self.undo.open.take() {
+            self.undo.push(step, &self.text);
+        }
         out
     }
 
-    fn edit_here(&self, kind: EditKind) -> LastEdit {
-        LastEdit {
-            kind,
-            cursor_y: self.cursor_y,
-            x: self.x(),
-            version: self.version,
-        }
-    }
-
-    fn joins_last_edit(&self, kind: EditKind) -> bool {
-        let after_space = self
-            .x()
-            .checked_sub(1)
-            .and_then(|i| self.current_line().chars().nth(i))
-            .is_some_and(char::is_whitespace);
-        kind != EditKind::Other && self.last_edit == Some(self.edit_here(kind)) && !after_space
-    }
-
-    fn clear_undo(&mut self) {
-        self.undo.clear();
-        self.last_edit = None;
-    }
-
-    /// Undoes the last step: one paste, one typed word, one word of backspaces.
-    /// `false` when there is nothing left to undo.
+    /// `false` when there is nothing left to undo. The step comes back as one
+    /// version, like the action that made it.
     pub fn undo(&mut self) -> bool {
-        let Some(snap) = self.undo.pop_back() else {
+        debug_assert!(
+            self.undo
+                .open
+                .as_ref()
+                .is_none_or(|s| s.inverses.is_empty()),
+            "undo inside an action that already edited"
+        );
+        let Some(step) = self.undo.steps.pop_back() else {
             return false;
         };
-        self.lines = snap.lines;
-        self.raw_x = snap.raw_x;
-        self.cursor_y = snap.cursor_y;
-        self.version += 1;
-        self.last_edit = None;
+        let redo = self.revert(step);
+        self.undo.undone.push(redo);
         true
+    }
+
+    /// Puts back what the last undo took, as one version. `false` when there
+    /// is nothing to redo: no undo yet, or an edit made since.
+    pub fn redo(&mut self) -> bool {
+        let Some(step) = self.undo.undone.pop() else {
+            return false;
+        };
+        let undo = self.revert(step);
+        self.undo.keep(undo);
+        true
+    }
+
+    /// Applies {step} and returns the step that reverts it in turn, which
+    /// leaves the caret and the selection where they are now. Each inverse
+    /// keeps the text it replaces, so undo and redo stay O(edit) like the
+    /// edit itself.
+    fn revert(&mut self, step: UndoStep) -> UndoStep {
+        let (cursor, anchor) = (self.cursor_byte(), self.anchor);
+        let writers = mem::replace(&mut self.writers, step.writers);
+        let inverses = step
+            .inverses
+            .into_iter()
+            .rev()
+            .map(|Inverse { start, end, text }| {
+                let removed = self.text[start..end].to_owned();
+                self.splice(start..end, &text, ChangeKind::Edit);
+                Inverse {
+                    start,
+                    end: start + text.len(),
+                    text: removed,
+                }
+            })
+            .collect();
+        self.commit();
+        self.place_cursor(step.cursor);
+        self.settle_cursor();
+        self.select(step.anchor);
+        UndoStep {
+            inverses,
+            cursor,
+            anchor,
+            writers,
+            group: None,
+        }
     }
 
     /// Counts every change to the value, never a cursor move. `maki.ui.input`
@@ -193,8 +650,65 @@ impl TextBuffer {
         self.version
     }
 
-    pub fn lines(&self) -> &[String] {
-        &self.lines
+    pub fn writers(&self) -> &Writers {
+        &self.writers
+    }
+
+    /// Adds {writer} when the text changed since version {since}, for a
+    /// change made for a plugin rather than by the user.
+    pub fn written_by(&mut self, writer: &PluginReach, since: u64) {
+        if self.version != since {
+            self.add_writer(writer);
+        }
+    }
+
+    /// Adds {writer} unless the text is blank, whatever changed to get it
+    /// here.
+    pub fn add_writer(&mut self, writer: &PluginReach) {
+        if !sent_text(&self.text).is_empty() {
+            self.writers.add(writer);
+        }
+    }
+
+    /// The changes that led from {version} to now, in the order they were
+    /// applied. `None` when {version} is older than the log reaches back, or
+    /// newer than the buffer.
+    pub fn changes_since(
+        &self,
+        version: u64,
+    ) -> Option<impl DoubleEndedIterator<Item = &Change> + Clone> {
+        let oldest = self
+            .changes
+            .front()
+            .map_or(self.version, |change| change.version - 1);
+        if !(oldest..=self.version).contains(&version) {
+            return None;
+        }
+        let skip = self
+            .changes
+            .partition_point(|change| change.version <= version);
+        Some(self.changes.range(skip..))
+    }
+
+    pub fn line(&self, y: usize) -> &str {
+        &self.text[self.line_range(y)]
+    }
+
+    pub fn lines(&self) -> impl Iterator<Item = &str> {
+        self.text.split('\n')
+    }
+
+    /// The line that byte {idx} of the value sits on.
+    pub fn line_of(&self, idx: usize) -> usize {
+        self.line_starts.partition_point(|&s| s <= idx) - 1
+    }
+
+    pub fn line_range(&self, y: usize) -> Range<usize> {
+        let end = self
+            .line_starts
+            .get(y + 1)
+            .map_or(self.text.len(), |next| next - 1);
+        self.line_starts[y]..end
     }
 
     pub fn x(&self) -> usize {
@@ -206,11 +720,11 @@ impl TextBuffer {
     }
 
     pub fn line_count(&self) -> usize {
-        self.lines.len()
+        self.line_starts.len()
     }
 
     fn current_line(&self) -> &str {
-        &self.lines[self.cursor_y]
+        self.line(self.cursor_y)
     }
 
     fn current_line_len(&self) -> usize {
@@ -223,70 +737,509 @@ impl TextBuffer {
             .map_or(s.len(), |(byte_idx, _)| byte_idx)
     }
 
-    fn byte_x(&self) -> usize {
-        Self::char_to_byte(self.current_line(), self.x())
+    fn value_byte_at_column(&self, char_x: usize) -> usize {
+        self.line_starts[self.cursor_y] + Self::char_to_byte(self.current_line(), char_x)
+    }
+
+    /// Every change to the value goes through here, so the text, the line
+    /// index and the log always agree. The change is logged under the next
+    /// version, and [`Self::commit`] makes that version current, so all the
+    /// splices of one transaction share it. An empty edit is dropped, so a
+    /// no-op like `Ctrl+K` at the end of a line leaves the version alone. An
+    /// empty replace is not, see [`Self::swap_prompt`].
+    fn splice(&mut self, range: Range<usize>, text: &str, kind: ChangeKind) -> bool {
+        if kind == ChangeKind::Edit && range.is_empty() && text.is_empty() {
+            return false;
+        }
+        let Range {
+            start,
+            end: old_end,
+        } = range;
+        let new_end = start + text.len();
+        self.text.replace_range(start..old_end, text);
+        self.cursor_cache.set(None);
+
+        // A line starting in `start + 1..=old_end` lost the newline before it.
+        let start_line = self.line_of(start);
+        let old_end_line = self.line_of(old_end);
+        for line_start in &mut self.line_starts[old_end_line + 1..] {
+            *line_start = *line_start - old_end + new_end;
+        }
+        self.line_starts.splice(
+            start_line + 1..old_end_line + 1,
+            line_starts_in(text, start),
+        );
+
+        let new_end_line = self.line_of(new_end);
+        self.rules
+            .splice(start_line..old_end_line + 1, new_end_line + 1 - start_line);
+        let change = Change {
+            version: self.version + 1,
+            start,
+            old_end,
+            new_end,
+            start_line,
+            old_end_line,
+            new_end_line,
+            kind,
+        };
+        // A chip deleted whole sits on the lines the change already points
+        // the layout at. Only a mark dropped lines away from them needs a
+        // full recount, and that goes for the marks of the last parse too.
+        let lines = start_line..=new_end_line;
+        let syntax_dropped = self.syntax_dropped(&change);
+        let dropped_away = self
+            .marks
+            .map(&change)
+            .into_iter()
+            .chain(syntax_dropped)
+            .any(|bytes| {
+                !lines.contains(&self.line_of(bytes.start))
+                    || !lines.contains(&self.line_of(bytes.end))
+            });
+        if dropped_away {
+            self.decor_epoch += 1;
+        }
+        self.changes.push_back(change);
+        true
+    }
+
+    #[cfg(test)]
+    pub fn marks(&self) -> &Marks {
+        &self.marks
+    }
+
+    pub fn decor_epoch(&self) -> u64 {
+        self.decor_epoch
+    }
+
+    /// Replaces what {plugin} has in namespace {ns}, with offsets into the
+    /// value at {version}. Returns where marks that change how rows wrap
+    /// came or went. Refused whole when one mark does not fit the text, like
+    /// an edit is.
+    ///
+    /// Marks from an older version move through every change since, as if
+    /// they had been placed back then, so a plugin racing the user's typing
+    /// gets the same marks it would have had by being quick. Whatever that
+    /// drops is dropped. Unlike an edit, nothing is refused for sitting next
+    /// to the typing: that is where ghost text lives.
+    pub fn set_marks(
+        &mut self,
+        version: u64,
+        plugin: &str,
+        ns: &str,
+        mut marks: Vec<Mark>,
+    ) -> Result<Vec<Range<usize>>, String> {
+        let changes = self.rebase(version, &mut [])?;
+        fit_marks(&changes, &mut marks, self.text.len(), |pos| {
+            self.text.is_char_boundary(pos)
+        })?;
+        let moved = self.marks.set(plugin, ns, marks);
+        self.settle_decor();
+        Ok(moved)
+    }
+
+    /// Returns where marks that change how rows wrap went.
+    pub fn clear_plugin_marks(&mut self, plugin: &str) -> Vec<Range<usize>> {
+        self.marks.clear_plugin(plugin)
+    }
+
+    pub fn toggle_raw(&mut self) {
+        self.raw = !self.raw;
+        self.decor_epoch += 1;
+        self.settle_decor();
+    }
+
+    pub fn set_rules(&mut self, rules: Arc<RuleSet>) {
+        self.syntax.set_rules(Arc::clone(rules.syntax()));
+        self.rules = RuleMarks::new(rules, self.line_count());
+        self.decor_epoch += 1;
+        self.settle_decor();
+    }
+
+    /// Takes in what the worker finished, and hands it the text when it lags
+    /// behind. Returns where the tree-sitter marks changed in the text now,
+    /// or `None` when no result came in. A result that cannot say where
+    /// recounts every line, and so does one replacing a result the log no
+    /// longer reaches back to: none of that one was shown, so even lines
+    /// where both results agree changed on screen.
+    pub fn poll_syntax(&mut self) -> Option<Vec<Range<usize>>> {
+        let was_shown = self.syntax_changes().is_some();
+        let changed = self.syntax.receive();
+        if self.syntax.wants_parse(self.version) {
+            let edit = self.syntax_changes().and_then(edit_since);
+            let input = match edit {
+                Some(edit) => SyntaxInput::Edit {
+                    inserted: self.text[edit.start..edit.new_end].to_owned(),
+                    start_row: self.line_of(edit.start),
+                    edit,
+                },
+                None => SyntaxInput::Whole(self.text.clone()),
+            };
+            self.syntax.parse(input, self.version);
+        }
+        let changed = changed?;
+        self.settle_decor();
+        let now = changed.filter(|_| was_shown).and_then(|ranges| {
+            let changes = self.syntax_changes()?;
+            let moved = ranges.into_iter().map(|bytes| {
+                changes
+                    .clone()
+                    .fold(bytes, |bytes, change| change.map_range(bytes))
+            });
+            Some(moved.collect())
+        });
+        Some(now.unwrap_or_else(|| {
+            self.decor_epoch += 1;
+            Vec::new()
+        }))
+    }
+
+    /// Whether the worker has parsed the text as it is now, which a bench
+    /// waits for to measure edits against a settled tree.
+    #[cfg(feature = "bench")]
+    pub fn syntax_is_current(&self) -> bool {
+        self.syntax.is_current(self.version)
+    }
+
+    /// Where the tree-sitter marks that shape rows and that {change}, not
+    /// logged yet, drops would have landed.
+    fn syntax_dropped(&self, change: &Change) -> Vec<Range<usize>> {
+        if !self.rules.shapes_rows() {
+            return Vec::new();
+        }
+        self.syntax
+            .touching(change.start..=change.old_end, self.syntax_changes())
+            .filter(|mark| {
+                mark.decoration.shapes_rows()
+                    && marks::remap(mark.bytes.clone(), mark.decoration, change).is_none()
+            })
+            .map(|mark| change.map_range(mark.bytes))
+            .collect()
+    }
+
+    fn derived(&self, bytes: RangeInclusive<usize>) -> impl Iterator<Item = Placed<'_>> {
+        let (from, to) = (*bytes.start(), *bytes.end());
+        let changes = self.syntax_changes();
+        (self.line_of(from)..=self.line_of(to))
+            .flat_map(move |y| self.rules.line(y, &self.text, self.line_range(y)))
+            .filter(move |mark| mark.bytes.start <= to && mark.bytes.end >= from)
+            .chain(self.syntax.touching(bytes, changes))
+    }
+
+    /// Placed and rule marks touching {bytes}, ends included, unsorted.
+    fn touching(&self, bytes: RangeInclusive<usize>) -> impl Iterator<Item = Placed<'_>> {
+        self.marks
+            .touching(bytes.clone())
+            .chain(self.derived(bytes))
+    }
+
+    /// The layout asks this for every line it counts, so when no rule can
+    /// change how rows wrap, it skips matching altogether.
+    fn shaping(&self, bytes: RangeInclusive<usize>) -> impl Iterator<Item = Placed<'_>> {
+        let derived = self
+            .rules
+            .shapes_rows()
+            .then(|| self.derived(bytes.clone()));
+        self.marks.shaping(bytes).chain(
+            derived
+                .into_iter()
+                .flatten()
+                .filter(|mark| mark.decoration.shapes_rows()),
+        )
+    }
+
+    /// The marks touching {bytes}, ends included, in the order they compose.
+    pub fn overlapping(&self, bytes: RangeInclusive<usize>) -> Vec<Placed<'_>> {
+        marks::composed(self.touching(bytes).collect())
+    }
+
+    pub fn inline_virts(&self, bytes: RangeInclusive<usize>) -> impl Iterator<Item = Placed<'_>> {
+        self.shaping(bytes)
+            .filter(|mark| mark.decoration.is_inline_virt())
+    }
+
+    /// The concealed ranges touching {bytes} as they are drawn now, sorted
+    /// and disjoint. None while the raw text is shown, and none the cursor
+    /// reveals.
+    pub fn concealed(&self, bytes: RangeInclusive<usize>) -> Vec<Concealed<'_>> {
+        if self.raw {
+            return Vec::new();
+        }
+        marks::concealed(self.shaping(bytes), || self.cursor_byte())
+    }
+
+    /// The conceals the cursor shows the text of. Moving the cursor in or
+    /// out of one changes how its lines wrap.
+    pub fn revealed(&self) -> Vec<Range<usize>> {
+        if self.raw {
+            return Vec::new();
+        }
+        let cursor = self.cursor_byte();
+        marks::revealed(self.shaping(cursor..=cursor), cursor)
+    }
+
+    fn hidden_at(&self, at: usize) -> Option<Range<usize>> {
+        self.concealed(at..=at)
+            .into_iter()
+            .map(|concealed| concealed.bytes)
+            .find(|bytes| bytes.contains(&at))
+    }
+
+    /// The lines drawn as one with line {y}. A concealed range over a line
+    /// break hides it, which joins the lines on both sides, so a conceal
+    /// spanning lines takes them all onto the line where it starts.
+    pub fn display_lines(&self, y: usize) -> Range<usize> {
+        let mut first = y;
+        while first > 0
+            && let Some(hidden) = self.hidden_at(self.line_starts[first] - 1)
+        {
+            first = self.line_of(hidden.start);
+        }
+        let mut last = y;
+        while let Some(hidden) = self.hidden_at(self.line_range(last).end) {
+            last = self.line_of(hidden.end);
+        }
+        first..last + 1
+    }
+
+    /// Where lines {lines} sit in the value, line breaks between them
+    /// included.
+    pub fn lines_bytes(&self, lines: Range<usize>) -> Range<usize> {
+        self.line_starts[lines.start]..self.line_range(lines.end - 1).end
+    }
+
+    fn atomic(&self, bytes: RangeInclusive<usize>) -> impl Iterator<Item = Range<usize>> + '_ {
+        self.touching(bytes)
+            .filter(|mark| mark.decoration.atomic)
+            .map(|mark| mark.bytes)
+    }
+
+    /// The range around byte {at} the cursor may not stop inside: an atomic
+    /// range, or a concealed one, which shows nothing to stand on.
+    fn blocked_at(&self, at: usize) -> Option<Range<usize>> {
+        self.atomic(at..=at)
+            .chain(self.hidden_at(at))
+            .filter(|bytes| bytes.start < at && at < bytes.end)
+            .reduce(hull)
+    }
+
+    /// Moves the cursor out of a range it may not stop inside. The way out
+    /// is picked once, so ranges that overlap cannot bounce it back and forth.
+    fn snap_cursor(&mut self, toward: Toward) {
+        let mut at = self.cursor_byte();
+        let Some(blocked) = self.blocked_at(at) else {
+            return;
+        };
+        let forward = match toward {
+            Toward::Start => false,
+            Toward::End => true,
+            Toward::Nearest => at - blocked.start > blocked.end - at,
+        };
+        let mut next = Some(blocked);
+        while let Some(blocked) = next {
+            at = if forward { blocked.end } else { blocked.start };
+            next = self.blocked_at(at);
+        }
+        self.place_cursor(at);
+        self.anchor = self.anchor.filter(|&anchor| anchor != at);
+    }
+
+    /// Keeps the cursor out of every range it may not stop inside. A motion
+    /// snaps the way it was going, and a key's edit as [`Self::edit`] says.
+    /// An undo and a plugin edit that puts the cursor down end here.
+    /// Otherwise the caret would be drawn at the edge of a conceal while the
+    /// keys act on bytes inside it that the user cannot see.
+    fn settle_cursor(&mut self) {
+        self.snap_cursor(Toward::Nearest);
+    }
+
+    /// [`Self::settle_cursor`] after a change of what is drawn: new marks,
+    /// rules or tree-sitter results, the raw text shown or hidden. The
+    /// cursor only moves on past the range, so text typed next lands after
+    /// what was typed, and a mark placed over the caret cannot send it back
+    /// to the start of the input.
+    fn settle_decor(&mut self) {
+        self.snap_cursor(Toward::End);
+    }
+
+    /// Grows {range} over every atomic range it cuts into, so a delete takes
+    /// a chip whole instead of leaving half of it behind.
+    fn widen(&self, mut range: Range<usize>) -> Range<usize> {
+        if range.is_empty() {
+            return range;
+        }
+        loop {
+            let grown = self
+                .atomic(range.start..=range.end)
+                .filter(|bytes| bytes.start < range.end && bytes.end > range.start)
+                .fold(range.clone(), hull);
+            if grown == range {
+                return range;
+            }
+            range = grown;
+        }
+    }
+
+    fn commit(&mut self) {
+        let pending = self
+            .changes
+            .back()
+            .is_some_and(|change| change.version > self.version);
+        if !pending {
+            return;
+        }
+        self.version += 1;
+        if sent_text(&self.text).is_empty() {
+            self.writers = Writers::default();
+        }
+        let syntax_shown = self.syntax_shapes_rows();
+        while self
+            .changes
+            .front()
+            .is_some_and(|change| change.version + CHANGE_LOG_LEN <= self.version)
+        {
+            self.changes.pop_front();
+        }
+        if syntax_shown && !self.syntax_shapes_rows() {
+            self.decor_epoch += 1;
+        }
+    }
+
+    /// Whether some rule can shape rows, which the rule set knows, and the log
+    /// still reaches back to the last parse, so its marks are on screen. Once
+    /// it no longer does, none of them can be moved to the text, so they all
+    /// go at once, lines away from any change.
+    fn syntax_shapes_rows(&self) -> bool {
+        self.rules.shapes_rows() && self.syntax_changes().is_some()
+    }
+
+    /// What led from the text of the last parse to now, which its marks need
+    /// to be shown at all.
+    fn syntax_changes(&self) -> Option<impl DoubleEndedIterator<Item = &Change> + Clone> {
+        self.changes_since(self.syntax.shown_version()?)
+    }
+
+    /// The edits the keys make. With text selected, every one of them puts
+    /// {text} over the selection instead, so typing replaces it and any
+    /// delete key takes just the selection. One that cuts into an atomic
+    /// range takes all of it, which a plugin edit never does: a plugin asks
+    /// for exact bytes.
+    ///
+    /// A caret that lands inside a range after an insert leaves past it, like
+    /// the `$` that makes `$s:go` a chip, so typed text keeps its order even
+    /// when a chip grows to take some of it in. After a delete it goes to the
+    /// nearer edge, so a Backspace that joins two words into one chip does
+    /// not jump past the chip.
+    fn edit(&mut self, range: Range<usize>, text: &str, caret: usize) {
+        let (range, caret) = match self.selection() {
+            Some(selected) => (selected.clone(), selected.start + text.len()),
+            None => (range, caret),
+        };
+        let whole = self.widen(range.clone());
+        let caret = if whole == range {
+            caret
+        } else {
+            whole.start + text.len()
+        };
+        let toward = if text.is_empty() {
+            Toward::Nearest
+        } else {
+            Toward::End
+        };
+        let replaces_all = whole == (0..self.text.len());
+        self.undoable(|buf| {
+            // No byte a plugin wrote is left, so the text is the user's now.
+            // Done inside the step, so undo brings the plugin's text back as
+            // the plugin's.
+            if replaces_all {
+                buf.writers = Writers::default();
+            }
+            buf.edit_all([(whole, text)], caret);
+        });
+        self.snap_cursor(toward);
+    }
+
+    /// Replaces sorted, disjoint ranges of the current value as one version,
+    /// so a reader catching up never sees the value half edited.
+    ///
+    /// An edit made outside any action still becomes a step of its own. Left
+    /// out, it would move the text under every older step and their ranges
+    /// would point at the wrong place.
+    fn edit_all<'a>(
+        &mut self,
+        edits: impl IntoIterator<Item = (Range<usize>, &'a str), IntoIter: DoubleEndedIterator>,
+        caret: usize,
+    ) {
+        self.undoable(|buf| {
+            // Back to front, so no range moves before its turn comes.
+            for (range, text) in edits.into_iter().rev() {
+                let start = range.start;
+                let removed = buf.text[range.clone()].to_owned();
+                if buf.splice(range, text, ChangeKind::Edit)
+                    && let Some(step) = &mut buf.undo.open
+                {
+                    step.inverses.push(Inverse {
+                        start,
+                        end: start + text.len(),
+                        text: removed,
+                    });
+                }
+            }
+            buf.commit();
+            buf.place_cursor(caret);
+            buf.anchor = None;
+        });
+    }
+
+    fn insert(&mut self, text: &str) {
+        let at = self.cursor_byte();
+        self.edit(at..at, text, at + text.len());
+    }
+
+    /// {idx} must be a char boundary within the value.
+    fn place_cursor(&mut self, idx: usize) {
+        self.cursor_y = self.line_of(idx);
+        self.raw_x = self.text[self.line_starts[self.cursor_y]..idx]
+            .chars()
+            .count();
     }
 
     pub fn push_char(&mut self, c: char) {
-        let bx = self.byte_x();
-        self.lines[self.cursor_y].insert(bx, c);
-        self.raw_x = self.x() + 1;
-        self.version += 1;
+        self.insert(c.encode_utf8(&mut [0; 4]));
     }
 
     pub fn insert_text(&mut self, text: &str) {
-        let sanitized = sanitize(text);
-        if sanitized.is_empty() {
-            return;
-        }
-        // Spliced in one go: inserting line by line shifts every line below
-        // the cursor once per pasted line.
-        let bx = self.byte_x();
-        let tail = self.lines[self.cursor_y].split_off(bx);
-        let mut chunks = sanitized.split('\n');
-        if let Some(first) = chunks.next() {
-            self.lines[self.cursor_y].push_str(first);
-        }
-        let below = self.cursor_y + 1;
-        self.lines.splice(below..below, chunks.map(str::to_string));
-        self.cursor_y += sanitized.matches('\n').count();
-        self.raw_x = self.current_line_len();
-        self.lines[self.cursor_y].push_str(&tail);
-        self.version += 1;
+        self.insert(&sanitize(text));
     }
 
     pub fn add_line(&mut self) {
-        let bx = self.byte_x();
-        let (left, right) = self.lines[self.cursor_y].split_at(bx);
-        let (left, right) = (left.to_string(), right.to_string());
-        self.lines[self.cursor_y] = left;
-        self.lines.insert(self.cursor_y + 1, right);
-        self.raw_x = 0;
-        self.cursor_y += 1;
-        self.version += 1;
+        self.insert("\n");
     }
 
+    /// At the start of a line the character before the cursor is the newline,
+    /// so removing it joins the two lines with no special case.
+    ///
+    /// At the very start there is nothing to remove, but the edit still runs
+    /// so a selection there is deleted.
     pub fn remove_char(&mut self) {
-        let x = self.x();
-        if x == 0 {
-            self.merge_with_previous_line();
-        } else {
-            let bx = Self::char_to_byte(self.current_line(), x - 1);
-            self.lines[self.cursor_y].remove(bx);
-            self.raw_x = x - 1;
-            self.version += 1;
-        }
+        let at = self.cursor_byte();
+        let from = self.text[..at]
+            .chars()
+            .next_back()
+            .map_or(at, |c| at - c.len_utf8());
+        self.edit(from..at, "", from);
     }
 
+    /// At the end of a line the character after the cursor is the newline, so
+    /// deleting it pulls the next line up.
     pub fn delete_char(&mut self) {
-        let x = self.x();
-        if x == self.current_line_len() {
-            self.merge_with_next_line();
-        } else {
-            let bx = self.byte_x();
-            self.lines[self.cursor_y].remove(bx);
-            self.version += 1;
-        }
+        let at = self.cursor_byte();
+        let end = self.text[at..]
+            .chars()
+            .next()
+            .map_or(at, |c| at + c.len_utf8());
+        self.edit(at..end, "", at);
     }
 
     fn wrap_to_prev_line(&mut self) -> bool {
@@ -300,7 +1253,7 @@ impl TextBuffer {
     }
 
     fn wrap_to_next_line(&mut self) -> bool {
-        if self.cursor_y < self.lines.len().saturating_sub(1) {
+        if self.cursor_y < self.line_count() - 1 {
             self.cursor_y += 1;
             self.raw_x = 0;
             true
@@ -337,53 +1290,49 @@ impl TextBuffer {
     pub fn delete_word_after_cursor(&mut self) {
         let x = self.x();
         if x == self.current_line_len() {
-            self.merge_with_next_line();
+            self.delete_char();
             return;
         }
-        let new_x = self.find_next_word_boundary(x);
-        let byte_start = Self::char_to_byte(self.current_line(), x);
-        let byte_end = Self::char_to_byte(self.current_line(), new_x);
-        self.lines[self.cursor_y].replace_range(byte_start..byte_end, "");
-        self.version += 1;
+        let at = self.cursor_byte();
+        let end = self.value_byte_at_column(self.find_next_word_boundary(x));
+        self.edit(at..end, "", at);
     }
 
     pub fn kill_to_end_of_line(&mut self) {
-        let bx = self.byte_x();
-        self.lines[self.cursor_y].truncate(bx);
-        self.version += 1;
+        let at = self.cursor_byte();
+        let end = self.lines_bytes(self.display_lines(self.cursor_y)).end;
+        self.edit(at..end, "", at);
     }
 
     pub fn remove_word_before_cursor(&mut self) {
         let x = self.x();
         if x == 0 {
-            self.merge_with_previous_line();
+            self.remove_char();
             return;
         }
-        let new_x = self.find_prev_word_boundary(x);
-        let line = self.current_line();
-        let byte_start = Self::char_to_byte(line, new_x);
-        let byte_end = Self::char_to_byte(line, x);
-        self.lines[self.cursor_y].replace_range(byte_start..byte_end, "");
-        self.raw_x = new_x;
-        self.version += 1;
+        let from = self.value_byte_at_column(self.find_prev_word_boundary(x));
+        let at = self.cursor_byte();
+        self.edit(from..at, "", from);
     }
 
     pub fn move_word_left(&mut self) {
         let x = self.x();
         if x == 0 {
             self.wrap_to_prev_line();
-            return;
+        } else {
+            self.raw_x = self.find_prev_word_boundary(x);
         }
-        self.raw_x = self.find_prev_word_boundary(x);
+        self.snap_cursor(Toward::Start);
     }
 
     pub fn move_word_right(&mut self) {
         let x = self.x();
         if x == self.current_line_len() {
             self.wrap_to_next_line();
-            return;
+        } else {
+            self.raw_x = self.find_next_word_boundary(x);
         }
-        self.raw_x = self.find_next_word_boundary(x);
+        self.snap_cursor(Toward::End);
     }
 
     pub fn move_left(&mut self) {
@@ -393,6 +1342,7 @@ impl TextBuffer {
         } else {
             self.wrap_to_prev_line();
         }
+        self.snap_cursor(Toward::Start);
     }
 
     pub fn move_right(&mut self) {
@@ -402,84 +1352,238 @@ impl TextBuffer {
         } else {
             self.wrap_to_next_line();
         }
+        self.snap_cursor(Toward::End);
     }
 
+    /// Lines joined by a conceal are one line on screen, so up goes to the
+    /// first line of the one drawn above.
     pub fn move_up(&mut self) {
-        if self.cursor_y > 0 {
-            self.cursor_y -= 1;
+        let first = self.display_lines(self.cursor_y).start;
+        if first > 0 {
+            self.cursor_y = self.display_lines(first - 1).start;
+            self.snap_cursor(Toward::Nearest);
         }
     }
 
     pub fn move_down(&mut self) {
-        if self.cursor_y < self.lines.len().saturating_sub(1) {
-            self.cursor_y += 1;
+        let end = self.display_lines(self.cursor_y).end;
+        if end < self.line_count() {
+            self.cursor_y = end;
+            self.snap_cursor(Toward::Nearest);
         }
     }
 
     pub fn move_home(&mut self) {
+        self.cursor_y = self.display_lines(self.cursor_y).start;
         self.raw_x = 0;
+        self.snap_cursor(Toward::Start);
     }
 
     pub fn move_end(&mut self) {
+        self.cursor_y = self.display_lines(self.cursor_y).end - 1;
         self.raw_x = self.current_line_len();
+        self.snap_cursor(Toward::End);
     }
 
-    /// Drops the value and the undo history with it: a submit, a swap or a
-    /// reset is the user putting the text down, and an undo that reaches back
-    /// past it would resurrect a prompt already sent.
     pub fn clear(&mut self) {
-        self.lines = vec![String::new()];
-        self.raw_x = 0;
-        self.cursor_y = 0;
-        self.version += 1;
-        self.clear_undo();
+        self.set_value("");
     }
 
-    /// Bytes in the whole buffer, newlines counted as one each. The unit
-    /// `maki.ui.input` speaks, because Lua string functions index bytes, so a
-    /// plugin slices the value it read with the offsets it was handed.
-    pub fn byte_len(&self) -> usize {
-        let bytes: usize = self.lines.iter().map(String::len).sum();
-        bytes + self.lines.len().saturating_sub(1)
-    }
-
-    /// The cursor as a flat byte offset into [`Self::byte_len`].
+    /// The cursor as a byte offset into [`Self::value`]. Bytes, not
+    /// characters, because Lua string functions index bytes, so a plugin can
+    /// slice the value it read with the offsets `maki.ui.input` hands it.
     pub fn cursor_byte(&self) -> usize {
-        let before: usize = self.lines[..self.cursor_y]
-            .iter()
-            .map(|l| l.len() + 1)
-            .sum();
-        before + Self::char_to_byte(self.current_line(), self.x())
-    }
-
-    /// Clamps past the end of the buffer, the way every other cursor move
-    /// here does, and refuses an offset inside a character.
-    pub fn set_cursor_byte(&mut self, idx: usize) -> Result<(), String> {
-        let mut left = idx.min(self.byte_len());
-        for (y, line) in self.lines.iter().enumerate() {
-            if left <= line.len() {
-                check_boundary(line, "cursor", left)?;
-                self.cursor_y = y;
-                self.raw_x = line[..left].chars().count();
-                return Ok(());
-            }
-            left -= line.len() + 1;
+        let at = (self.cursor_y, self.raw_x);
+        if let Some((cached_at, byte)) = self.cursor_cache.get()
+            && cached_at == at
+        {
+            return byte;
         }
-        self.move_to_end();
-        Ok(())
+        let byte = self.value_byte_at_column(self.x());
+        self.cursor_cache.set(Some((at, byte)));
+        byte
     }
 
-    /// Replaces a flat byte range, leaving the cursor after the inserted text
-    /// unless {cursor} names another offset.
+    /// Applies {edits}, all planned against the value at {version}, as one
+    /// version and one undo step, and returns where the cursor landed: at
+    /// {cursor} if given, an offset into the value the edits produce, else at
+    /// the end of the text of the edit with the highest start. A cursor past
+    /// the end is clamped to it, and one inside a range it may not stop in
+    /// moves to the nearer edge. Marks alone only move it on past the range,
+    /// like any change of what is drawn, see [`Self::settle_decor`].
     ///
-    /// Errors instead of clamping: these ranges come from async plugin
+    /// Errors instead of clamping a range: these come from async plugin
     /// handlers, so a range that no longer fits means the buffer moved under
     /// the caller and the edit would land somewhere it was never meant to.
-    /// The cursor is checked against the value the edit produces, so a bad one
-    /// refuses the whole edit instead of leaving half applied.
+    /// Everything is checked before the first byte changes, so a refused
+    /// transaction leaves nothing half applied.
     ///
-    /// {text} is sanitized the way typed and pasted text is, so the default
-    /// cursor lands at the end of what was really inserted.
+    /// The text is sanitized the way typed and pasted text is, so the default
+    /// cursor counts what was really inserted. With {cursor}, {anchor} or
+    /// {marks} given, text sanitizing would change is refused instead: they
+    /// count bytes of the text as sent, which would no longer be there.
+    ///
+    /// {anchor} selects from there to the cursor, counted like {cursor} and
+    /// widened over an atomic range it lands in, as a selection made with
+    /// the keys would be. Without it nothing stays selected.
+    ///
+    /// {marks}, when given, replace what the plugin named first has in their
+    /// namespace. They count in the same value as {cursor} and land in the
+    /// same change as the text, or refuse it with them. Where marks that
+    /// change how rows wrap came or went is returned next to the cursor.
+    ///
+    /// No {edits} with a {cursor}, an {anchor} or {marks} leaves the text
+    /// alone, which makes neither a version nor an undo step. The cursor then
+    /// stays where it is unless {cursor} moves it or {marks} hide it. {marks}
+    /// alone leave the selection too.
+    pub fn apply_edits(
+        &mut self,
+        version: u64,
+        mut edits: Vec<TextEdit>,
+        cursor: Option<usize>,
+        anchor: Option<usize>,
+        mut marks: Option<(&str, InputMarks)>,
+    ) -> Result<(usize, Vec<Range<usize>>), String> {
+        let marks_only = edits.is_empty() && cursor.is_none() && anchor.is_none();
+        if marks_only && marks.is_none() {
+            return Err(NOTHING_TO_APPLY_ERR.into());
+        }
+        edits.sort_by_key(|edit| edit.start);
+        check_ranges(&edits)?;
+        let counts_offsets = cursor.is_some() || anchor.is_some() || marks.is_some();
+        for edit in &mut edits {
+            let clean = sanitize(&edit.text);
+            if counts_offsets && clean != edit.text {
+                return Err(UNCLEAN_TEXT_ERR.into());
+            }
+            edit.text = clean;
+        }
+        let changes = self.rebase(version, &mut edits)?;
+        let mapped = |at: Option<usize>| {
+            at.map(|at| {
+                map_offset(&changes, at).ok_or_else(|| {
+                    format!(
+                        "{CURSOR_CONFLICT_ERR} (planned on version {version}, now {})",
+                        self.version
+                    )
+                })
+            })
+            .transpose()
+        };
+        let (cursor, anchor) = (mapped(cursor)?, mapped(anchor)?);
+
+        let len = self.text.len();
+        for &TextEdit { start, stop, .. } in &edits {
+            if stop > len {
+                return Err(format!("stop {stop} {PAST_END_ERR} ({len})"));
+            }
+            check_boundary(self.text.is_char_boundary(start), "start", start)?;
+            check_boundary(self.text.is_char_boundary(stop), "stop", stop)?;
+        }
+
+        let grown: usize = edits.iter().map(|edit| edit.text.len()).sum();
+        let shrunk: usize = edits.iter().map(|edit| edit.stop - edit.start).sum();
+        let new_len = len + grown - shrunk;
+        let caret = match (cursor, edits.last()) {
+            (Some(at), _) => at,
+            (None, Some(last)) => last.stop + grown - shrunk,
+            (None, None) => self.cursor_byte(),
+        }
+        .min(new_len);
+        check_boundary(self.is_boundary_after(&edits, caret), "cursor", caret)?;
+        let anchor = if marks_only {
+            self.anchor
+        } else {
+            anchor.map(|anchor| anchor.min(new_len))
+        };
+        if let Some(anchor) = anchor {
+            check_boundary(self.is_boundary_after(&edits, anchor), "anchor", anchor)?;
+        }
+        if let Some((_, pushed)) = &mut marks {
+            fit_marks(&changes, &mut pushed.marks, new_len, |pos| {
+                self.is_boundary_after(&edits, pos)
+            })?;
+        }
+        let places_caret = cursor.is_some() || !edits.is_empty();
+        self.edit_all(
+            edits
+                .iter()
+                .map(|edit| (edit.start..edit.stop, edit.text.as_str())),
+            caret,
+        );
+        let moved = marks.map_or_else(Vec::new, |(plugin, pushed)| {
+            self.marks.set(plugin, &pushed.ns, pushed.marks)
+        });
+        if places_caret {
+            self.settle_cursor();
+        } else {
+            self.settle_decor();
+        }
+        self.select(anchor);
+        Ok((self.cursor_byte(), moved))
+    }
+
+    /// Moves {edits}, planned against {version}, past every change made
+    /// since. Returns those changes as they read in the value the edits
+    /// would have made of the old one, each shifted past the edits before
+    /// it. That is the value a plugin counts its cursor and marks in, so
+    /// they are mapped forward through these.
+    ///
+    /// A change that overlaps or touches a range refuses the lot: the user
+    /// typed right where the edit lands, and there is no telling whether that
+    /// text belongs before it, after it or under it. A whole-value replace
+    /// refuses it too, because the offsets point into another prompt.
+    fn rebase(&self, version: u64, edits: &mut [TextEdit]) -> Result<Vec<Change>, String> {
+        let changes = self.changes_since(version).ok_or_else(|| {
+            format!(
+                "{VERSION_TOO_OLD_ERR} (planned on version {version}, now {})",
+                self.version
+            )
+        })?;
+        changes
+            .map(|change| {
+                if change.kind == ChangeKind::Replace {
+                    return Err(INPUT_REPLACED_ERR.into());
+                }
+                let (mut grown, mut shrunk) = (0, 0);
+                for edit in edits.iter_mut() {
+                    if edit.stop < change.start {
+                        grown += edit.text.len();
+                        shrunk += edit.stop - edit.start;
+                    } else if edit.start > change.old_end {
+                        edit.start = edit.start + change.new_end - change.old_end;
+                        edit.stop = edit.stop + change.new_end - change.old_end;
+                    } else {
+                        return Err(format!(
+                            "{EDIT_CONFLICT_ERR} (planned on version {version}, now {})",
+                            self.version
+                        ));
+                    }
+                }
+                Ok(change.past(grown, shrunk))
+            })
+            .collect()
+    }
+
+    /// Whether {caret}, an offset into the value {edits} would make of this
+    /// one, falls on a character boundary there.
+    fn is_boundary_after(&self, edits: &[TextEdit], caret: usize) -> bool {
+        let (mut grown, mut shrunk) = (0, 0);
+        for edit in edits {
+            let start = edit.start + grown - shrunk;
+            if caret < start {
+                break;
+            }
+            if caret <= start + edit.text.len() {
+                return edit.text.is_char_boundary(caret - start);
+            }
+            grown += edit.text.len();
+            shrunk += edit.stop - edit.start;
+        }
+        self.text.is_char_boundary(caret + shrunk - grown)
+    }
+
+    #[cfg(test)]
     pub fn replace_byte_range(
         &mut self,
         start: usize,
@@ -487,201 +1591,171 @@ impl TextBuffer {
         text: &str,
         cursor: Option<usize>,
     ) -> Result<(), String> {
-        if start > stop {
-            return Err(format!("start {start} is past stop {stop}"));
-        }
-        let len = self.byte_len();
-        if stop > len {
-            return Err(format!("stop {stop} is past the end of the input ({len})"));
-        }
-        let value = self.value();
-        check_boundary(&value, "start", start)?;
-        check_boundary(&value, "stop", stop)?;
-
-        let text = sanitize(text);
-        let mut next = String::with_capacity(value.len() - (stop - start) + text.len());
-        next.push_str(&value[..start]);
-        next.push_str(&text);
-        next.push_str(&value[stop..]);
-
-        let caret = cursor.unwrap_or(start + text.len()).min(next.len());
-        check_boundary(&next, "cursor", caret)?;
-
-        self.lines = next.split('\n').map(str::to_string).collect();
-        self.version += 1;
-        self.set_cursor_byte(caret)
+        let edit = TextEdit {
+            start,
+            stop,
+            text: text.into(),
+        };
+        self.apply_edits(self.version, vec![edit], cursor, None, None)
+            .map(drop)
     }
 
+    /// Puts the cursor on line {y}, column {x}, or at the nearer edge of a
+    /// range it may not stop inside.
     pub fn set_cursor(&mut self, y: usize, x: usize) {
-        self.cursor_y = y.min(self.lines.len().saturating_sub(1));
+        self.cursor_y = y.min(self.line_count() - 1);
         self.raw_x = x.min(self.current_line_len());
+        self.snap_cursor(Toward::Nearest);
     }
 
     pub fn move_to_end(&mut self) {
-        self.cursor_y = self.lines.len().saturating_sub(1);
+        self.cursor_y = self.line_count() - 1;
         self.raw_x = self.current_line_len();
-    }
-
-    fn merge_with_next_line(&mut self) {
-        if self.cursor_y + 1 < self.lines.len() {
-            let next = self.lines.remove(self.cursor_y + 1);
-            self.lines[self.cursor_y].push_str(&next);
-            self.version += 1;
-        }
-    }
-
-    fn merge_with_previous_line(&mut self) {
-        if self.cursor_y == 0 {
-            return;
-        }
-        self.cursor_y -= 1;
-        self.raw_x = self.current_line_len();
-        self.merge_with_next_line();
     }
 
     pub fn kill_to_start_of_line(&mut self) {
-        let byte_x = Self::char_to_byte(&self.lines[self.cursor_y], self.x());
-        self.lines[self.cursor_y].drain(..byte_x);
-        self.raw_x = 0;
-        self.version += 1;
+        let from = self.line_starts[self.display_lines(self.cursor_y).start];
+        let at = self.cursor_byte();
+        self.edit(from..at, "", from);
     }
 
+    /// A backspace that deletes a selection is a step of its own, like a word
+    /// kill, so it never joins the backspaces around it.
     pub fn handle_key(&mut self, key: KeyEvent) -> EditResult {
-        let m = key.modifiers;
-        let ctrl = m.contains(KeyModifiers::CONTROL) && !m.contains(KeyModifiers::ALT);
-        let alt = m.contains(KeyModifiers::ALT) && !m.contains(KeyModifiers::CONTROL);
-        let sup = m.contains(KeyModifiers::SUPER);
-
-        if ctrl {
-            return match key.code {
-                KeyCode::Left => {
-                    self.move_word_left();
-                    EditResult::Moved
-                }
-                KeyCode::Right => {
-                    self.move_word_right();
-                    EditResult::Moved
-                }
-                KeyCode::Backspace | KeyCode::Char('w') => {
-                    self.edit(EditKind::Other, Self::remove_word_before_cursor);
-                    EditResult::Changed
-                }
-                KeyCode::Delete => {
-                    self.edit(EditKind::Other, Self::delete_word_after_cursor);
-                    EditResult::Changed
-                }
-                KeyCode::Char('k') => {
-                    self.edit(EditKind::Other, Self::kill_to_end_of_line);
-                    EditResult::Changed
-                }
-                KeyCode::Char('a') => {
-                    self.move_home();
-                    EditResult::Moved
-                }
-                KeyCode::Char('e') => {
-                    self.move_end();
-                    EditResult::Moved
-                }
-                _ => EditResult::Ignored,
-            };
+        if self.handle_motion_key(key, false) == EditResult::Moved {
+            return EditResult::Moved;
         }
-
-        if alt {
-            return match key.code {
-                KeyCode::Left | KeyCode::Char('b') => {
-                    self.move_word_left();
-                    EditResult::Moved
-                }
-                KeyCode::Right | KeyCode::Char('f') => {
-                    self.move_word_right();
-                    EditResult::Moved
-                }
-                KeyCode::Backspace => {
-                    self.edit(EditKind::Other, Self::remove_word_before_cursor);
-                    EditResult::Changed
-                }
-                KeyCode::Delete | KeyCode::Char('d') => {
-                    self.edit(EditKind::Other, Self::delete_word_after_cursor);
-                    EditResult::Changed
-                }
-                _ => EditResult::Ignored,
-            };
-        }
-
-        if sup {
-            return match key.code {
-                KeyCode::Left => {
-                    self.move_home();
-                    EditResult::Moved
-                }
-                KeyCode::Right => {
-                    self.move_end();
-                    EditResult::Moved
-                }
-                KeyCode::Backspace => {
-                    self.edit(EditKind::Other, Self::kill_to_start_of_line);
-                    EditResult::Changed
-                }
-                // Cmd+Z where the terminal delivers it (kitty-protocol).
-                // Ctrl+Z is suspend and reserved; there is no notation for
-                // SUPER, so no plugin can want this key for itself.
-                KeyCode::Char('z') => {
-                    if self.undo() {
-                        EditResult::Changed
-                    } else {
-                        EditResult::Ignored
-                    }
-                }
-                _ => EditResult::Ignored,
-            };
-        }
-
-        match key.code {
-            KeyCode::Char(c) => {
-                self.edit(EditKind::Typing, |buf| buf.push_char(c));
-                EditResult::Changed
-            }
-            KeyCode::Backspace => {
-                self.edit(EditKind::Deleting, Self::remove_char);
-                EditResult::Changed
-            }
-            KeyCode::Delete => {
-                self.edit(EditKind::Other, Self::delete_char);
-                EditResult::Changed
-            }
-            KeyCode::Left => {
-                self.move_left();
-                EditResult::Moved
-            }
-            KeyCode::Right => {
-                self.move_right();
-                EditResult::Moved
-            }
-            KeyCode::Home => {
-                self.move_home();
-                EditResult::Moved
-            }
-            KeyCode::End => {
-                self.move_end();
-                EditResult::Moved
-            }
-            KeyCode::Up => {
-                self.move_up();
-                EditResult::Moved
-            }
-            KeyCode::Down => {
-                self.move_down();
-                EditResult::Moved
-            }
-            _ => EditResult::Ignored,
-        }
+        let (ctrl, alt, sup) = modifiers(key);
+        let group = match key.code {
+            _ if ctrl || alt || sup => None,
+            KeyCode::Char(_) => Some(EditGroup::Typing),
+            KeyCode::Backspace if self.anchor.is_none() => Some(EditGroup::Deleting),
+            _ => None,
+        };
+        self.undo_step(group, |buf| buf.apply_edit_key(key.code, ctrl, alt, sup))
     }
+
+    /// Only the keys of [`Self::handle_key`] that move the cursor. Normal mode
+    /// uses this, so the text never changes under a vim plugin. With {select}
+    /// the motion stretches the selection from where the cursor was, and
+    /// without it the selection goes.
+    pub fn handle_motion_key(&mut self, key: KeyEvent, select: bool) -> EditResult {
+        let (ctrl, alt, sup) = modifiers(key);
+        let Some(motion) = motion(key.code, ctrl, alt, sup) else {
+            return EditResult::Ignored;
+        };
+        let anchor = select.then(|| self.anchor.unwrap_or_else(|| self.cursor_byte()));
+        motion(self);
+        self.select(anchor);
+        EditResult::Moved
+    }
+
+    pub fn anchor(&self) -> Option<usize> {
+        self.anchor
+    }
+
+    pub fn selection(&self) -> Option<Range<usize>> {
+        let cursor = self.cursor_byte();
+        self.anchor
+            .map(|anchor| anchor.min(cursor)..anchor.max(cursor))
+    }
+
+    /// `false` when nothing was selected.
+    pub fn deselect(&mut self) -> bool {
+        self.anchor.take().is_some()
+    }
+
+    /// Selects from {anchor} to the cursor. An anchor inside an atomic range
+    /// moves to its far edge, so the selection takes the range whole, and an
+    /// anchor on the cursor selects nothing.
+    fn select(&mut self, anchor: Option<usize>) {
+        let cursor = self.cursor_byte();
+        self.anchor = anchor.filter(|&at| at != cursor).map(|anchor| {
+            let whole = self.widen(anchor.min(cursor)..anchor.max(cursor));
+            if anchor < cursor {
+                whole.start
+            } else {
+                whole.end
+            }
+        });
+    }
+
+    fn apply_edit_key(&mut self, code: KeyCode, ctrl: bool, alt: bool, sup: bool) -> EditResult {
+        match code {
+            KeyCode::Backspace | KeyCode::Char('w') if ctrl => self.remove_word_before_cursor(),
+            KeyCode::Delete if ctrl => self.delete_word_after_cursor(),
+            KeyCode::Char('k') if ctrl => self.kill_to_end_of_line(),
+            KeyCode::Backspace if alt => self.remove_word_before_cursor(),
+            KeyCode::Delete | KeyCode::Char('d') if alt => self.delete_word_after_cursor(),
+            _ if ctrl || alt => return EditResult::Ignored,
+            KeyCode::Backspace if sup => self.kill_to_start_of_line(),
+            // Cmd+Z only arrives on terminals that speak the kitty keyboard
+            // protocol. Most never send it, which is why the app binds Alt+Z.
+            KeyCode::Char('z') if sup => {
+                return if self.undo() {
+                    EditResult::Changed
+                } else {
+                    EditResult::Ignored
+                };
+            }
+            _ if sup => return EditResult::Ignored,
+            KeyCode::Char(c) => self.push_char(c),
+            KeyCode::Backspace => self.remove_char(),
+            KeyCode::Delete => self.delete_char(),
+            _ => return EditResult::Ignored,
+        }
+        EditResult::Changed
+    }
+}
+
+/// `(ctrl, alt, super)`, with Ctrl and Alt held together counting as neither.
+fn modifiers(key: KeyEvent) -> (bool, bool, bool) {
+    let m = key.modifiers;
+    (
+        m.contains(KeyModifiers::CONTROL) && !m.contains(KeyModifiers::ALT),
+        m.contains(KeyModifiers::ALT) && !m.contains(KeyModifiers::CONTROL),
+        m.contains(KeyModifiers::SUPER),
+    )
+}
+
+/// A held modifier claims its key even when it has no motion for it, so
+/// `Ctrl+Home` does nothing instead of acting like a plain `Home`.
+fn motion(code: KeyCode, ctrl: bool, alt: bool, sup: bool) -> Option<fn(&mut TextBuffer)> {
+    Some(match code {
+        KeyCode::Left if ctrl || alt => TextBuffer::move_word_left,
+        KeyCode::Right if ctrl || alt => TextBuffer::move_word_right,
+        KeyCode::Char('a') if ctrl => TextBuffer::move_home,
+        KeyCode::Char('e') if ctrl => TextBuffer::move_end,
+        KeyCode::Char('b') if alt => TextBuffer::move_word_left,
+        KeyCode::Char('f') if alt => TextBuffer::move_word_right,
+        _ if ctrl || alt => return None,
+        KeyCode::Left if sup => TextBuffer::move_home,
+        KeyCode::Right if sup => TextBuffer::move_end,
+        _ if sup => return None,
+        KeyCode::Left => TextBuffer::move_left,
+        KeyCode::Right => TextBuffer::move_right,
+        KeyCode::Home => TextBuffer::move_home,
+        KeyCode::End => TextBuffer::move_end,
+        KeyCode::Up => TextBuffer::move_up,
+        KeyCode::Down => TextBuffer::move_down,
+        _ => return None,
+    })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{EditKind, EditResult, MAX_UNDO, TAB_SPACES, TextBuffer};
+    use super::test_support::{mark_ranges, text_edit};
+    use super::{
+        CHANGE_LOG_LEN, CURSOR_CONFLICT_ERR, ChangeKind, EDIT_CONFLICT_ERR, EditResult,
+        INPUT_REPLACED_ERR, INSIDE_CHAR_ERR, InputMarks, MAX_UNDO, NOTHING_TO_APPLY_ERR,
+        OVERLAPPING_EDITS_ERR, PAST_END_ERR, Prompt, TAB_SPACES, TextBuffer, TextEdit,
+        UNCLEAN_TEXT_ERR, VERSION_TOO_OLD_ERR,
+    };
+    use super::{Decoration, Mark, Reveal, RuleSet};
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+    use maki_lua::{InputRule, PatternRule, PluginPermissions, PluginReach};
+    use std::ops::Range;
+    use std::sync::Arc;
     use test_case::test_case;
 
     fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
@@ -691,6 +1765,25 @@ mod tests {
             kind: KeyEventKind::Press,
             state: KeyEventState::NONE,
         }
+    }
+
+    /// Reads the lines through the line index and checks them against the
+    /// text, so every test that looks at lines also catches a drifted index.
+    fn lines(buf: &TextBuffer) -> Vec<&str> {
+        let indexed: Vec<&str> = (0..buf.line_count()).map(|y| buf.line(y)).collect();
+        assert_eq!(
+            indexed,
+            buf.value().split('\n').collect::<Vec<_>>(),
+            "the line index drifted from the text"
+        );
+        indexed
+    }
+
+    fn changes(buf: &TextBuffer, since: u64) -> Vec<(usize, usize, usize, ChangeKind)> {
+        buf.changes_since(since)
+            .expect("the log still reaches that far back")
+            .map(|change| (change.start, change.old_end, change.new_end, change.kind))
+            .collect()
     }
 
     #[test]
@@ -708,18 +1801,22 @@ mod tests {
         let mut buf = TextBuffer::new("abcd".into());
         buf.raw_x = 2;
         buf.add_line();
-        assert_eq!(buf.lines(), &["ab", "cd"]);
+        assert_eq!(lines(&buf), ["ab", "cd"]);
 
         buf.remove_char();
         assert_eq!(buf.value(), "abcd");
     }
 
+    /// The column remembered from the longer line above must not outlive the
+    /// join, or the cursor jumps to the end of the joined line.
     #[test]
-    fn delete_char_merges_lines() {
-        let mut buf = TextBuffer::new("ab\ncd".into());
-        buf.raw_x = 2;
+    fn delete_char_merges_lines_and_keeps_the_cursor_put() {
+        let mut buf = TextBuffer::new("longer\nab\ncd".into());
+        buf.set_cursor(0, 6);
+        buf.move_down();
         buf.delete_char();
-        assert_eq!(buf.value(), "abcd");
+        assert_eq!(lines(&buf), ["longer", "abcd"]);
+        assert_eq!((buf.y(), buf.x()), (1, 2));
     }
 
     #[test]
@@ -737,7 +1834,7 @@ mod tests {
     fn insert_text_multiline() {
         let mut buf = TextBuffer::new(String::new());
         buf.insert_text("line1\nline2\nline3");
-        assert_eq!(buf.lines(), &["line1", "line2", "line3"]);
+        assert_eq!(lines(&buf), ["line1", "line2", "line3"]);
         assert_eq!(buf.y(), 2);
         assert_eq!(buf.x(), 5);
     }
@@ -747,14 +1844,14 @@ mod tests {
         let mut buf = TextBuffer::new("abcd".into());
         buf.raw_x = 2;
         buf.insert_text("X\nY");
-        assert_eq!(buf.lines(), &["abX", "Ycd"]);
+        assert_eq!(lines(&buf), ["abX", "Ycd"]);
     }
 
     #[test]
     fn insert_text_replaces_tabs_with_spaces() {
         let mut buf = TextBuffer::new(String::new());
         buf.insert_text("\tindented\n\t\tdouble");
-        assert_eq!(buf.lines(), &["  indented", "    double"]);
+        assert_eq!(lines(&buf), ["  indented", "    double"]);
     }
 
     /// The terminal gives a control character no cells while the input box
@@ -872,7 +1969,7 @@ mod tests {
         let mut buf = TextBuffer::new("a●b".into());
         buf.raw_x = 2;
         buf.add_line();
-        assert_eq!(buf.lines(), &["a●", "b"]);
+        assert_eq!(lines(&buf), ["a●", "b"]);
 
         let mut buf = TextBuffer::new("a●b".into());
         buf.raw_x = 2;
@@ -921,7 +2018,7 @@ mod tests {
 
         let mut buf = TextBuffer::new("ab\ncd".into());
         buf.kill_to_end_of_line();
-        assert_eq!(buf.lines(), &["", "cd"]);
+        assert_eq!(lines(&buf), ["", "cd"]);
 
         let mut buf = TextBuffer::new("●text".into());
         buf.raw_x = 1;
@@ -986,31 +2083,25 @@ mod tests {
         assert_eq!(buf.cursor_byte(), expected);
     }
 
-    #[test_case("",        0 ; "empty")]
-    #[test_case("abc",     3 ; "single_line")]
-    #[test_case("ab\ncd",  5 ; "two_lines")]
-    #[test_case("🦀\n🦀",  9 ; "emoji")]
-    fn byte_len_matches_flat_length(value: &str, expected: usize) {
-        assert_eq!(TextBuffer::new(value.into()).byte_len(), expected);
-    }
-
     #[test_case(0, 0, 0 ; "start")]
     #[test_case(3, 1, 0 ; "line_start")]
     #[test_case(5, 1, 2 ; "end")]
     #[test_case(99, 1, 2 ; "past_end_clamps")]
-    fn set_cursor_byte_round_trips(idx: usize, y: usize, x: usize) {
+    fn an_empty_edit_moves_only_the_cursor(idx: usize, y: usize, x: usize) {
         let mut buf = TextBuffer::new("ab\ncd".into());
-        buf.set_cursor_byte(idx).unwrap();
+        let before = buf.version();
+        buf.replace_byte_range(0, 0, "", Some(idx)).unwrap();
         assert_eq!((buf.y(), buf.x()), (y, x));
+        assert_eq!(buf.version(), before);
     }
 
     /// Rounding down to the character that offset is inside of would silently
     /// move the cursor somewhere the plugin never asked for.
     #[test_case(1 ; "inside_the_first_char")]
     #[test_case(8 ; "inside_a_char_on_the_second_line")]
-    fn set_cursor_byte_refuses_an_offset_inside_a_char(idx: usize) {
+    fn a_cursor_inside_a_char_is_refused(idx: usize) {
         let mut buf = TextBuffer::new("日本\n語".into());
-        assert!(buf.set_cursor_byte(idx).is_err());
+        assert!(buf.replace_byte_range(0, 0, "", Some(idx)).is_err());
         assert_eq!((buf.y(), buf.x()), (0, 0));
     }
 
@@ -1026,7 +2117,7 @@ mod tests {
     fn replace_byte_range_inserts_newlines() {
         let mut buf = TextBuffer::new("ab".into());
         buf.replace_byte_range(1, 1, "\nX\n", None).unwrap();
-        assert_eq!(buf.lines(), &["a", "X", "b"]);
+        assert_eq!(lines(&buf), ["a", "X", "b"]);
         assert_eq!((buf.y(), buf.x()), (2, 0));
     }
 
@@ -1083,7 +2174,7 @@ mod tests {
     #[test_case("a\rb"    ; "lone_cr")]
     fn set_value_keeps_the_text_verbatim(value: &str) {
         let mut buf = TextBuffer::new(String::new());
-        buf.set_value(value.into());
+        buf.set_value(value);
         assert_eq!(buf.value(), value);
     }
 
@@ -1097,151 +2188,753 @@ mod tests {
         assert_eq!(buf.cursor_byte(), 1 + TAB_SPACES.len());
     }
 
-    #[test]
-    fn version_counts_value_changes_and_ignores_cursor_moves() {
-        let mut buf = TextBuffer::new("ab".into());
-        let start = buf.version();
-        buf.move_home();
-        buf.move_right();
-        assert_eq!(buf.version(), start, "moving the cursor changes no value");
+    const PLANNED_ON: &str = "hello world";
 
-        buf.push_char('c');
-        let typed = buf.version();
-        assert!(typed > start);
+    /// The cursor counts in the value the plugin meant to make, so it has to
+    /// follow the user's change just like the ranges do. In that value the
+    /// deleted `w` sits after both `**`, past cursor 7, even though its old
+    /// offset was 6.
+    #[test_case(vec![text_edit(0, 5, "hi")], None, |b| { b.move_to_end(); b.push_char('!') }, "hi world!", 2 ; "typed_after")]
+    #[test_case(vec![text_edit(6, 6, "**"), text_edit(11, 11, "**")], Some(13), |b| { b.set_cursor(0, 0); b.insert_text("oh ") }, "oh hello **world**", 16 ; "typed_before_moves_the_cursor_too")]
+    #[test_case(vec![text_edit(0, 0, "**"), text_edit(5, 5, "**")], Some(7), |b| { b.set_cursor(0, 7); b.remove_char() }, "**hello** orld", 7 ; "deleted_after_the_cursor")]
+    #[test_case(vec![text_edit(5, 6, "_")], None, |b| { b.apply_edits(b.version(), vec![text_edit(0, 0, "**"), text_edit(11, 11, "**")], None, None, None).unwrap(); }, "**hello_world**", 8 ; "between_the_ranges_of_one_transaction")]
+    fn a_stale_edit_moves_past_changes_that_do_not_touch_it(
+        edits: Vec<TextEdit>,
+        cursor: Option<usize>,
+        user: fn(&mut TextBuffer),
+        expected: &str,
+        expected_cursor: usize,
+    ) {
+        let mut buf = TextBuffer::new(PLANNED_ON.into());
+        let planned = buf.version();
+        user(&mut buf);
 
-        buf.set_value("recalled".into());
-        assert!(
-            buf.version() > typed,
-            "a whole-value swap has to keep the counter climbing"
-        );
-    }
-
-    fn type_text(buf: &mut TextBuffer, text: &str) {
-        for c in text.chars() {
-            buf.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE));
-        }
-    }
-
-    fn paste(buf: &mut TextBuffer, text: &str) {
-        buf.edit(EditKind::Other, |buf| buf.insert_text(text));
-    }
-
-    #[test_case("pasted text" ; "one line")]
-    #[test_case("one\ntwo\nthree" ; "many lines")]
-    fn undo_restores_a_paste_in_one_step(text: &str) {
-        let mut buf = TextBuffer::new("keep ".into());
-        buf.move_to_end();
-        paste(&mut buf, text);
-        assert!(buf.undo());
-        assert_eq!(buf.value(), "keep ");
-        assert!(
-            !buf.undo(),
-            "the fresh buffer has nothing older to give back"
-        );
-    }
-
-    #[test]
-    fn undo_rewinds_typing_word_by_word() {
-        let mut buf = TextBuffer::new(String::new());
-        type_text(&mut buf, "hello world");
-        buf.undo();
-        assert_eq!(buf.value(), "hello ");
-        buf.undo();
-        assert_eq!(buf.value(), "");
-    }
-
-    #[test]
-    fn backspaces_undo_word_by_word() {
-        let mut buf = TextBuffer::new("hello world".into());
-        buf.move_to_end();
-        for _ in 0..6 {
-            buf.handle_key(key(KeyCode::Backspace, KeyModifiers::NONE));
-        }
-        assert_eq!(buf.value(), "hello");
-        buf.undo();
-        assert_eq!(buf.value(), "hello ");
-        buf.undo();
-        assert_eq!(buf.value(), "hello world");
-    }
-
-    #[test]
-    fn typing_somewhere_else_is_a_new_step() {
-        let mut buf = TextBuffer::new(String::new());
-        type_text(&mut buf, "ab");
-        buf.handle_key(key(KeyCode::Left, KeyModifiers::NONE));
-        type_text(&mut buf, "x");
-        assert_eq!(buf.value(), "axb");
-        buf.undo();
-        assert_eq!(buf.value(), "ab");
         assert_eq!(
-            (buf.x(), buf.y()),
-            (1, 0),
-            "undo restores where the caret was"
+            buf.apply_edits(planned, edits, cursor, None, None)
+                .map(|(caret, _)| caret),
+            Ok(expected_cursor)
         );
-        buf.undo();
-        assert_eq!(buf.value(), "");
+        assert_eq!(buf.value(), expected);
+        assert_eq!(buf.cursor_byte(), expected_cursor);
+    }
+
+    #[test_case(vec![text_edit(0, 5, "hi")], None, |b| { b.set_cursor(0, 5); b.push_char('!') }, EDIT_CONFLICT_ERR ; "typed_at_the_end")]
+    #[test_case(vec![text_edit(6, 11, "there")], None, |b| { b.set_cursor(0, 6); b.remove_char() }, EDIT_CONFLICT_ERR ; "deleted_up_to_the_start")]
+    #[test_case(vec![text_edit(0, 11, "")], None, |b| { b.set_cursor(0, 3); b.push_char('x') }, EDIT_CONFLICT_ERR ; "typed_inside")]
+    #[test_case(vec![text_edit(5, 5, ",")], None, |b| { b.set_cursor(0, 5); b.push_char(';') }, EDIT_CONFLICT_ERR ; "inserted_at_the_same_offset")]
+    #[test_case(vec![text_edit(0, 0, "> ")], Some(9), |b| b.replace_byte_range(6, 9, "", None).unwrap(), CURSOR_CONFLICT_ERR ; "cursor_inside_changed_text")]
+    #[test_case(vec![text_edit(0, 0, "> ")], None, |b| b.set_value("hello world, again"), INPUT_REPLACED_ERR ; "whole_value_replaced")]
+    #[test_case(vec![text_edit(0, 0, "> ")], None, |b| { b.move_to_end(); for _ in 0..=CHANGE_LOG_LEN { b.push_char('!') } }, VERSION_TOO_OLD_ERR ; "planned_before_the_log_reaches")]
+    fn a_stale_edit_it_cannot_map_is_refused(
+        edits: Vec<TextEdit>,
+        cursor: Option<usize>,
+        user: fn(&mut TextBuffer),
+        err: &str,
+    ) {
+        let mut buf = TextBuffer::new(PLANNED_ON.into());
+        let planned = buf.version();
+        user(&mut buf);
+        let (value, version) = (buf.value().to_owned(), buf.version());
+
+        let refused = buf
+            .apply_edits(planned, edits, cursor, None, None)
+            .unwrap_err();
+        assert!(refused.starts_with(err), "{refused}");
+        assert_eq!(buf.value(), value);
+        assert_eq!(buf.version(), version);
+    }
+
+    /// Listed out of order on purpose, since a plugin should not have to sort.
+    #[test]
+    fn edits_land_as_one_version_and_one_undo_step() {
+        const EDITED: &str = "> hello **world**";
+        let mut buf = TextBuffer::new(PLANNED_ON.into());
+        let before = buf.version();
+        let edits = vec![
+            text_edit(11, 11, "**"),
+            text_edit(0, 0, "> "),
+            text_edit(6, 6, "**"),
+        ];
+
+        assert_eq!(
+            buf.apply_edits(before, edits, None, None, None)
+                .map(|(caret, _)| caret),
+            Ok(EDITED.len())
+        );
+        assert_eq!(buf.value(), EDITED);
+        assert_eq!(buf.version(), before + 1);
+        assert_eq!(undo_all(&mut buf), [PLANNED_ON]);
+        assert_eq!(buf.version(), before + 2);
+        assert!(buf.redo());
+        assert_eq!((buf.value(), buf.version()), (EDITED, before + 3));
+    }
+
+    /// No edits only move the cursor or select, with no new version and no
+    /// undo step. The cursor still counts in the value at {version}, so the
+    /// user's typing since moves it along like it moves an edit.
+    #[test_case(false, Some(3), None => (3, None) ; "a_cursor_moves_it")]
+    #[test_case(true, Some(3), None => (4, None) ; "a_cursor_planned_before_typing_moves_past_it")]
+    #[test_case(false, None, Some(6) => (11, Some(6..11)) ; "an_anchor_selects")]
+    fn no_edits_move_the_cursor_and_the_selection(
+        typed_first: bool,
+        cursor: Option<usize>,
+        anchor: Option<usize>,
+    ) -> (usize, Option<Range<usize>>) {
+        let mut buf = TextBuffer::new(PLANNED_ON.into());
+        let planned = buf.version();
+        buf.move_to_end();
+        if typed_first {
+            buf.move_home();
+            buf.push_char('!');
+        }
+        let (version, steps) = (buf.version(), buf.undo.steps.len());
+
+        let (caret, _) = buf
+            .apply_edits(planned, vec![], cursor, anchor, None)
+            .unwrap();
+        assert_eq!(buf.cursor_byte(), caret);
+        assert_eq!((buf.version(), buf.undo.steps.len()), (version, steps));
+        (caret, buf.selection())
+    }
+
+    #[test_case(vec![],                                           NOTHING_TO_APPLY_ERR  ; "none")]
+    #[test_case(vec![text_edit(0, 5, "a"), text_edit(3, 8, "b")], OVERLAPPING_EDITS_ERR ; "overlapping")]
+    #[test_case(vec![text_edit(5, 5, "a"), text_edit(5, 5, "b")], OVERLAPPING_EDITS_ERR ; "two_inserts_at_one_offset")]
+    #[test_case(vec![text_edit(5, 5, "a"), text_edit(5, 8, "b")], OVERLAPPING_EDITS_ERR ; "insert_where_a_range_starts")]
+    fn an_edit_list_without_one_clear_order_is_refused(edits: Vec<TextEdit>, err: &str) {
+        let mut buf = TextBuffer::new(PLANNED_ON.into());
+        let version = buf.version();
+        let refused = buf
+            .apply_edits(version, edits, None, None, None)
+            .unwrap_err();
+        assert!(refused.starts_with(err), "{refused}");
+        assert_eq!(buf.value(), PLANNED_ON);
+    }
+
+    #[test_case("abc", "aXc", 1, 2, 2 ; "middle")]
+    #[test_case("abc", "",    0, 3, 0 ; "cleared")]
+    #[test_case("aa",  "aaa", 2, 2, 3 ; "repeated_char_is_not_counted_twice")]
+    #[test_case("é",   "ê",   0, 2, 2 ; "shared_lead_byte_is_not_split")]
+    #[test_case("xé",  "xè",  1, 3, 3 ; "shared_lead_byte_after_a_prefix")]
+    #[test_case("é",   "ũ",   0, 2, 2 ; "shared_trail_byte_is_not_split")]
+    #[test_case("fix the parser\nthen ship", "fix the lexer\nthen ship", 8, 12, 11 ; "one_word_of_many_lines")]
+    #[test_case("abc", "abc", 3, 3, 3 ; "the_same_text_still_logs_a_replace")]
+    #[test_case("",    "",    0, 0, 0 ; "two_empty_prompts_still_log_a_replace")]
+    fn a_whole_value_write_logs_only_what_differs(
+        old: &str,
+        new: &str,
+        start: usize,
+        old_end: usize,
+        new_end: usize,
+    ) {
+        let mut buf = TextBuffer::new(old.into());
+        let since = buf.version();
+        buf.set_value(new);
+        assert_eq!(lines(&buf), new.split('\n').collect::<Vec<_>>());
+        assert_eq!(
+            changes(&buf, since),
+            [(start, old_end, new_end, ChangeKind::Replace)]
+        );
+    }
+
+    #[test_case(|buf| { buf.set_cursor(0, 2); buf.kill_to_end_of_line() } ; "kill_at_end_of_line")]
+    #[test_case(|buf| { buf.move_to_end(); buf.delete_char() }           ; "delete_at_end")]
+    #[test_case(TextBuffer::remove_char                                  ; "backspace_at_start")]
+    #[test_case(|buf| { buf.move_to_end(); buf.move_up() }              ; "cursor_moves")]
+    fn an_edit_that_changes_nothing_keeps_the_version(edit: fn(&mut TextBuffer)) {
+        let mut buf = TextBuffer::new("ab\ncd".into());
+        let before = buf.version();
+        edit(&mut buf);
+        assert_eq!(buf.value(), "ab\ncd");
+        assert_eq!(buf.version(), before);
+        assert!(
+            buf.changes_since(before + 1).is_none(),
+            "a version the buffer never had"
+        );
+    }
+
+    /// A plugin that read the prompt put away cannot mistake the one that
+    /// came in for it, even when both read the same, as two empty chat
+    /// drafts or a recalled entry equal to the text do.
+    #[test_case("ab\ncd" ; "same_text")]
+    #[test_case(""       ; "both_empty")]
+    fn a_prompt_swap_refuses_edits_planned_before_it(text: &str) {
+        let mut buf = TextBuffer::new(text.into());
+        let planned = buf.version();
+        buf.set_value(text);
+        assert_eq!(buf.version(), planned + 1);
+
+        let refused = buf
+            .apply_edits(planned, vec![text_edit(0, 0, "x")], None, None, None)
+            .unwrap_err();
+        assert!(refused.starts_with(INPUT_REPLACED_ERR), "{refused}");
+        assert_eq!(buf.value(), text);
     }
 
     #[test]
-    fn typing_after_a_paste_is_a_new_step() {
+    fn a_multi_line_paste_is_one_edit() {
+        let mut buf = TextBuffer::new("ab".into());
+        buf.set_cursor(0, 1);
+        let since = buf.version();
+        buf.insert_text("1\n2\n3");
+        assert_eq!(changes(&buf, since), [(1, 1, 6, ChangeKind::Edit)]);
+        let lines: Vec<_> = buf
+            .changes_since(since)
+            .unwrap()
+            .map(|change| (change.start_line, change.old_end_line, change.new_end_line))
+            .collect();
+        assert_eq!(lines, [(0, 0, 2)]);
+    }
+
+    fn type_keys(buf: &mut TextBuffer, text: &str) {
+        for c in text.chars() {
+            buf.handle_key(plain(KeyCode::Char(c)));
+        }
+    }
+
+    fn undo_all(buf: &mut TextBuffer) -> Vec<String> {
+        let mut seen = Vec::new();
+        while buf.undo() {
+            seen.push(buf.value().to_owned());
+        }
+        seen
+    }
+
+    #[test]
+    fn typing_and_backspaces_undo_word_by_word() {
         let mut buf = TextBuffer::new(String::new());
-        paste(&mut buf, "pasted");
-        type_text(&mut buf, "x");
-        buf.undo();
-        assert_eq!(buf.value(), "pasted");
+        type_keys(&mut buf, "hello world");
+        for _ in 0.." world".len() {
+            buf.handle_key(plain(KeyCode::Backspace));
+        }
+        assert_eq!(undo_all(&mut buf), ["hello ", "hello world", "hello ", ""]);
     }
 
     #[test]
-    fn a_plugin_write_undoes_in_one_step() {
-        let mut buf = TextBuffer::new("pick a file".into());
-        buf.edit(EditKind::Other, |buf| {
-            buf.replace_byte_range(7, 11, "/tmp/x.rs", None)
-        })
-        .unwrap();
+    fn only_typing_elsewhere_breaks_a_run() {
+        let mut buf = TextBuffer::new("abc".into());
+        buf.move_to_end();
+        type_keys(&mut buf, "d");
+        buf.handle_key(plain(KeyCode::Left));
+        buf.handle_key(plain(KeyCode::Right));
+        type_keys(&mut buf, "e");
+        buf.set_cursor(0, 0);
+        type_keys(&mut buf, "x");
+
         assert!(buf.undo());
-        assert_eq!(buf.value(), "pick a file");
+        assert_eq!((buf.value(), buf.x()), ("abcde", 0));
+        assert!(buf.undo());
+        assert_eq!((buf.value(), buf.x()), ("abc", 3));
     }
 
-    #[test]
-    fn clear_forgets_the_history() {
-        let mut buf = TextBuffer::new("sent".into());
-        paste(&mut buf, " again");
-        buf.clear();
-        assert!(!buf.undo(), "a submitted prompt does not come back");
-    }
-
-    #[test]
-    fn an_edit_that_changes_nothing_leaves_no_step() {
+    #[test_case(|buf| { buf.handle_key(ctrl(KeyCode::Char('w'))); buf.handle_key(ctrl(KeyCode::Char('w'))); }, &["word"] ; "a_word_kill_with_nothing_left")]
+    #[test_case(|buf| { buf.replace_byte_range(0, 4, "word", None).unwrap(); }, &[] ; "rewriting_the_same_text")]
+    #[test_case(|buf| { type_keys(buf, "s"); buf.replace_byte_range(0, 5, "words", None).unwrap(); }, &["word"] ; "rewriting_the_same_text_after_typing")]
+    fn an_action_that_changes_nothing_leaves_no_step(act: fn(&mut TextBuffer), undone: &[&str]) {
         let mut buf = TextBuffer::new("word".into());
         buf.move_to_end();
-        let kill_word = key(KeyCode::Char('w'), KeyModifiers::CONTROL);
-        buf.handle_key(kill_word);
-        buf.handle_key(kill_word);
-        assert!(buf.undo());
-        assert_eq!(buf.value(), "word");
-        assert!(!buf.undo(), "the second kill had nothing left to take");
+        act(&mut buf);
+        assert_eq!(undo_all(&mut buf), undone);
     }
 
     #[test]
-    fn history_is_capped() {
+    fn a_step_keeps_only_the_text_its_edit_removed() {
+        let mut buf = TextBuffer::new("pick a file".into());
+        buf.replace_byte_range(7, 11, "fn main() {}\n", None)
+            .unwrap();
+        let kept: Vec<&str> = buf
+            .undo
+            .steps
+            .iter()
+            .flat_map(|step| &step.inverses)
+            .map(|inverse| inverse.text.as_str())
+            .collect();
+        assert_eq!(kept, ["file"]);
+        assert_eq!(undo_all(&mut buf), ["pick a file"]);
+    }
+
+    #[test]
+    fn an_edit_outside_any_action_is_its_own_step() {
         let mut buf = TextBuffer::new(String::new());
-        for _ in 0..(MAX_UNDO + 10) {
-            paste(&mut buf, "a ");
-        }
-        let mut undos = 0;
-        while buf.undo() {
-            undos += 1;
-        }
-        assert_eq!(undos, MAX_UNDO, "history must not grow without bound");
+        buf.push_char('a');
+        type_keys(&mut buf, "b");
+        buf.push_char('c');
+        assert_eq!(undo_all(&mut buf), ["ab", "a", ""]);
     }
 
     #[test]
-    fn super_z_undoes_through_handle_key() {
-        let mut buf = TextBuffer::new("hi".into());
+    fn undo_is_logged_as_an_edit() {
+        let mut buf = TextBuffer::new("keep".into());
         buf.move_to_end();
-        paste(&mut buf, " there");
-        let result = buf.handle_key(key(KeyCode::Char('z'), KeyModifiers::SUPER));
-        assert_eq!(result, EditResult::Changed);
-        assert_eq!(buf.value(), "hi");
+        buf.insert_text(" this");
+        let since = buf.version();
+        buf.undo();
+        assert_eq!(changes(&buf, since), [(4, 9, 4, ChangeKind::Edit)]);
+    }
+
+    #[test_case(|buf| buf.clear()                                          ; "after_an_action")]
+    #[test_case(|buf| buf.undoable(|buf| { buf.push_char('!'); buf.clear() }) ; "inside_an_action")]
+    fn a_whole_value_write_forgets_undo_and_redo(write: fn(&mut TextBuffer)) {
+        let mut buf = TextBuffer::new(String::new());
+        type_keys(&mut buf, "hello world");
+        buf.undo();
+        write(&mut buf);
+        assert_eq!((buf.undo(), buf.redo()), (false, false));
+    }
+
+    #[test]
+    fn the_history_keeps_only_the_newest_steps() {
+        let mut buf = TextBuffer::new(String::new());
+        for _ in 0..MAX_UNDO + 1 {
+            buf.insert_text("a");
+        }
+        assert_eq!(undo_all(&mut buf).len(), MAX_UNDO);
+        assert_eq!(buf.value(), "a");
+    }
+
+    #[test]
+    fn redo_walks_forward_until_the_next_edit() {
+        let mut buf = TextBuffer::new(String::new());
+        type_keys(&mut buf, "hello world");
+        assert_eq!(undo_all(&mut buf), ["hello ", ""]);
+
+        assert!(buf.redo());
+        assert_eq!((buf.value(), buf.cursor_byte()), ("hello ", 6));
+        assert!(buf.redo());
+        assert_eq!((buf.value(), buf.cursor_byte()), ("hello world", 11));
+        assert!(!buf.redo());
+        assert_eq!(undo_all(&mut buf), ["hello ", ""]);
+
+        buf.push_char('!');
+        assert!(!buf.redo());
+    }
+
+    const PLUGIN: &str = "test";
+    const NS: &str = "marks";
+
+    #[derive(Clone, Copy)]
+    enum Kind {
+        Atomic,
+        Hidden,
+        Revealing,
+        Raw,
+    }
+
+    fn marked(text: &str, bytes: Range<usize>, kind: Kind, cursor: usize) -> TextBuffer {
+        let mut buf = TextBuffer::new(text.into());
+        let decoration = Decoration {
+            atomic: matches!(kind, Kind::Atomic),
+            conceal: (!matches!(kind, Kind::Atomic)).then(|| "[chip]".into()),
+            reveal: match kind {
+                Kind::Revealing => Reveal::Cursor,
+                _ => Reveal::Never,
+            },
+            ..Decoration::default()
+        };
+        let mark = Mark {
+            start: bytes.start,
+            stop: Some(bytes.end),
+            decoration: Arc::new(decoration),
+        };
+        buf.set_marks(buf.version(), PLUGIN, NS, vec![mark])
+            .unwrap();
+        if matches!(kind, Kind::Raw) {
+            buf.toggle_raw();
+        }
+        buf.place_cursor(cursor);
+        buf
+    }
+
+    #[test_case("a one two b", 2..9, Kind::Atomic, 9, TextBuffer::move_left => 2 ; "left_steps_over_an_atomic_range")]
+    #[test_case("a one two b", 2..9, Kind::Atomic, 2, TextBuffer::move_right => 9 ; "right_steps_over_an_atomic_range")]
+    #[test_case("a one two b", 2..9, Kind::Atomic, 1, TextBuffer::move_word_right => 9 ; "word_right_stops_after_an_atomic_range")]
+    #[test_case("a one two b", 2..9, Kind::Atomic, 9, TextBuffer::move_word_left => 2 ; "word_left_stops_before_an_atomic_range")]
+    #[test_case("a one two b", 2..9, Kind::Hidden, 2, TextBuffer::move_right => 9 ; "right_steps_over_concealed_text")]
+    #[test_case("a one two b", 2..9, Kind::Revealing, 2, TextBuffer::move_right => 3 ; "right_walks_into_text_the_cursor_reveals")]
+    #[test_case("a one two b", 2..9, Kind::Raw, 2, TextBuffer::move_right => 3 ; "right_walks_into_raw_text")]
+    #[test_case("abcdefgh\nab one two", 12..19, Kind::Atomic, 6, TextBuffer::move_down => 12 ; "down_lands_on_the_nearer_edge_before")]
+    #[test_case("abcdefgh\nab one two", 12..19, Kind::Atomic, 7, TextBuffer::move_down => 19 ; "down_lands_on_the_nearer_edge_after")]
+    #[test_case("a\nb\nc\nd", 1..4, Kind::Hidden, 0, TextBuffer::move_down => 6 ; "down_skips_the_lines_a_conceal_joined")]
+    #[test_case("a\nb\nc\nd", 1..4, Kind::Hidden, 6, TextBuffer::move_up => 0 ; "up_skips_the_lines_a_conceal_joined")]
+    #[test_case("a\nb\nc\nd", 1..4, Kind::Hidden, 5, TextBuffer::move_home => 0 ; "home_goes_to_the_start_of_joined_lines")]
+    #[test_case("a\nb\nc\nd", 1..4, Kind::Hidden, 0, TextBuffer::move_end => 5 ; "end_goes_to_the_end_of_joined_lines")]
+    #[test_case("a one two b", 2..9, Kind::Atomic, 0, |b| b.set_cursor(0, 3) => 2 ; "placing_inside_an_atomic_range_snaps_to_the_nearer_start")]
+    #[test_case("a one two b", 2..9, Kind::Atomic, 0, |b| b.set_cursor(0, 7) => 9 ; "placing_inside_an_atomic_range_snaps_to_the_nearer_end")]
+    fn cursor_motion(
+        text: &str,
+        bytes: Range<usize>,
+        kind: Kind,
+        from: usize,
+        motion: fn(&mut TextBuffer),
+    ) -> usize {
+        let mut buf = marked(text, bytes, kind, from);
+        motion(&mut buf);
+        buf.cursor_byte()
+    }
+
+    const CHIP_TEXT: &str = "a $s:go b";
+    const CHIP: Range<usize> = 2..7;
+    const INSIDE_THE_CHIP: usize = 4;
+
+    fn hidden(bytes: Range<usize>) -> Mark {
+        Mark {
+            decoration: Arc::new(Decoration {
+                conceal: Some("[go]".into()),
+                ..Decoration::default()
+            }),
+            ..highlight(bytes)
+        }
+    }
+
+    /// Whatever starts hiding the text around the cursor moves it to an
+    /// edge, where the caret is drawn. A change of what is drawn moves it on
+    /// past the chip, and a plugin cursor goes to the nearer edge, so
+    /// Backspace takes the space before the chip and never a byte hidden
+    /// inside it.
+    #[test_case(|b| { b.set_marks(b.version(), PLUGIN, NS, vec![hidden(CHIP)]).unwrap(); b.toggle_raw(); b.set_cursor(0, INSIDE_THE_CHIP); b.toggle_raw() } => CHIP.end ; "raw_text_hidden_again")]
+    #[test_case(|b| { b.set_cursor(0, INSIDE_THE_CHIP); b.set_marks(b.version(), PLUGIN, NS, vec![hidden(CHIP)]).unwrap(); } => CHIP.end ; "a_conceal_placed_around_it")]
+    #[test_case(|b| { b.set_marks(b.version(), PLUGIN, NS, vec![hidden(CHIP)]).unwrap(); b.apply_edits(b.version(), vec![], Some(INSIDE_THE_CHIP), None, None).unwrap(); b.remove_char(); assert_eq!(b.value(), "a$s:go b"); } => CHIP.start - 1 ; "a_plugin_cursor_inside_it")]
+    fn the_cursor_never_rests_inside_hidden_text(hide: fn(&mut TextBuffer)) -> usize {
+        let mut buf = TextBuffer::new(CHIP_TEXT.into());
+        hide(&mut buf);
+        buf.cursor_byte()
+    }
+
+    fn chip_rules(pattern: &str) -> Arc<RuleSet> {
+        let chip = Decoration {
+            atomic: true,
+            ..Decoration::default()
+        };
+        RuleSet::with_plugins(&[InputRule::Pattern(PatternRule::new(pattern, chip).unwrap())])
+    }
+
+    /// A delete that makes a chip sends the caret to its nearer edge, so the
+    /// next Backspace does not take the whole chip. Typing always goes past
+    /// it, so the keys land in the order they were pressed: typing the `$`
+    /// of `$s:go` leaves the caret after `go`, not back before the `$`.
+    #[test_case(r"@\S+", "@f longword", 3, TextBuffer::remove_char => ("@flongword".into(), 0) ; "a_backspace_that_joins_two_words")]
+    #[test_case(r"\w+@\w+", "ab@cd", 0, |buf| type_keys(buf, "xy") => ("xab@cdy".into(), 7) ; "typing_in_front_of_a_chip_that_grows")]
+    #[test_case(r"\$s:\w+", "fix s:go", 4, |buf| type_keys(buf, "$") => ("fix $s:go".into(), 9) ; "typing_that_begins_a_chip")]
+    fn a_key_edit_inside_a_chip(
+        pattern: &str,
+        text: &str,
+        from: usize,
+        key: fn(&mut TextBuffer),
+    ) -> (String, usize) {
+        let mut buf = TextBuffer::new(text.into());
+        buf.set_rules(chip_rules(pattern));
+        buf.place_cursor(from);
+        key(&mut buf);
+        (buf.value().to_owned(), buf.cursor_byte())
+    }
+
+    /// The grown delete is still one splice, so one undo brings the whole
+    /// chip back, caret and all.
+    #[test_case("say CHIP now", 4..8, 8, TextBuffer::remove_char => ("say  now".into(), 4) ; "backspace_takes_a_chip_whole")]
+    #[test_case("say CHIP now", 4..8, 4, TextBuffer::delete_char => ("say  now".into(), 4) ; "delete_takes_a_chip_whole")]
+    #[test_case("say CHIP now", 2..6, 9, TextBuffer::remove_word_before_cursor => ("sanow".into(), 2) ; "a_word_kill_that_cuts_in_takes_the_chip")]
+    #[test_case("ab CHIP\ncd ef", 5..10, 3, TextBuffer::kill_to_end_of_line => ("ab  ef".into(), 3) ; "a_line_kill_takes_a_chip_over_the_line_break")]
+    fn deleting_into_an_atomic_range(
+        text: &str,
+        bytes: Range<usize>,
+        from: usize,
+        delete: fn(&mut TextBuffer),
+    ) -> (String, usize) {
+        let mut buf = marked(text, bytes, Kind::Atomic, from);
+        delete(&mut buf);
+        let deleted = (buf.value().to_owned(), buf.cursor_byte());
+        assert!(buf.undo());
+        assert_eq!((buf.value(), buf.cursor_byte()), (text, from));
+        assert!(!buf.undo());
+        deleted
+    }
+
+    fn point(start: usize) -> Mark {
+        Mark {
+            start,
+            stop: None,
+            decoration: Arc::new(Decoration::default()),
+        }
+    }
+
+    fn highlight(bytes: Range<usize>) -> Mark {
+        Mark {
+            start: bytes.start,
+            stop: Some(bytes.end),
+            decoration: Arc::new(Decoration::default()),
+        }
+    }
+
+    fn chip(bytes: Range<usize>) -> Mark {
+        Mark {
+            decoration: Arc::new(Decoration {
+                atomic: true,
+                ..Decoration::default()
+            }),
+            ..highlight(bytes)
+        }
+    }
+
+    /// A plugin hears about the text a frame late. Its marks should end up
+    /// where they would be had it pushed them before the user typed.
+    #[test_case(vec![point(11)], |b| { b.move_to_end(); b.insert_text("!!") }, vec![13..13] ; "ghost_text_at_the_caret_follows_typing")]
+    #[test_case(vec![chip(0..5), highlight(6..11)], |b| { b.set_cursor(0, 3); b.push_char('x') }, vec![7..12] ; "a_chip_typed_into_is_dropped_and_the_rest_still_placed")]
+    fn stale_marks_move_like_placed_ones(
+        marks: Vec<Mark>,
+        user: fn(&mut TextBuffer),
+        expected: Vec<Range<usize>>,
+    ) {
+        let mut buf = TextBuffer::new(PLANNED_ON.into());
+        let planned = buf.version();
+        user(&mut buf);
+
+        buf.set_marks(planned, PLUGIN, NS, marks).unwrap();
+        assert_eq!(mark_ranges(&buf), expected);
+    }
+
+    /// A chip drawn over the caret moves it on past the chip, never back to
+    /// the start, where a typed `!` would make a shell line. Marks and rules
+    /// need no `input`, so they must not steer the user's next key.
+    #[test_case(|b| { b.set_marks(b.version(), PLUGIN, NS, vec![chip(0..2)]).unwrap(); } => 2 ; "pushed_marks")]
+    #[test_case(|b| b.set_rules(chip_rules("he")) => 2 ; "a_rule")]
+    fn a_chip_drawn_over_the_caret_moves_it_on(decorate: fn(&mut TextBuffer)) -> usize {
+        let mut buf = TextBuffer::new(PLANNED_ON.into());
+        buf.place_cursor(1);
+        decorate(&mut buf);
+        buf.cursor_byte()
+    }
+
+    #[test_case(|b| b.set_value("another prompt"), INPUT_REPLACED_ERR ; "across_a_replace")]
+    #[test_case(|b| { b.move_to_end(); for _ in 0..=CHANGE_LOG_LEN { b.push_char('!') } }, VERSION_TOO_OLD_ERR ; "past_the_log")]
+    #[test_case(|b| { b.set_cursor(0, 0); b.push_char('!') }, PAST_END_ERR ; "past_the_end")]
+    fn stale_marks_it_cannot_place_are_refused_whole(user: fn(&mut TextBuffer), err: &str) {
+        let mut buf = TextBuffer::new(PLANNED_ON.into());
+        let planned = buf.version();
+        buf.set_marks(planned, PLUGIN, NS, vec![point(0)]).unwrap();
+        user(&mut buf);
+        let kept = mark_ranges(&buf);
+
+        let refused = buf
+            .set_marks(
+                planned,
+                PLUGIN,
+                NS,
+                vec![highlight(0..PLANNED_ON.len() + 1)],
+            )
+            .unwrap_err();
+        assert!(refused.contains(err), "{refused}");
+        assert_eq!(mark_ranges(&buf), kept);
+    }
+
+    /// Ghost text pushed for the prompt put away never turns up in the next
+    /// one, and comes back with its own prompt.
+    #[test]
+    fn marks_leave_and_come_back_with_their_prompt() {
+        let mut buf = TextBuffer::new(PLANNED_ON.into());
+        let marks = vec![point(5), highlight(0..5)];
+        buf.set_marks(buf.version(), PLUGIN, NS, marks).unwrap();
+
+        let away = buf.swap_prompt(Prompt::default());
+        buf.insert_text("typed");
+        assert!(mark_ranges(&buf).is_empty());
+
+        buf.swap_prompt(away);
+        assert_eq!(buf.value(), PLANNED_ON);
+        assert_eq!(mark_ranges(&buf), vec![0..5, 5..5]);
+    }
+
+    fn pushed(marks: Vec<Mark>) -> Option<(&'static str, InputMarks)> {
+        Some((
+            PLUGIN,
+            InputMarks {
+                ns: NS.into(),
+                marks,
+            },
+        ))
+    }
+
+    #[test]
+    fn marks_of_a_stale_edit_land_on_its_text() {
+        let mut buf = TextBuffer::new(PLANNED_ON.into());
+        let planned = buf.version();
+        buf.set_cursor(0, 0);
+        buf.insert_text("oh ");
+
+        buf.apply_edits(
+            planned,
+            vec![text_edit(6, 6, "XY")],
+            None,
+            None,
+            pushed(vec![chip(6..8)]),
+        )
+        .unwrap();
+        assert_eq!(buf.value(), "oh hello XYworld");
+        assert_eq!(mark_ranges(&buf), vec![9..11]);
+    }
+
+    #[test_case("XY", 0..3, PAST_END_ERR ; "past_the_end")]
+    #[test_case("é", 0..1, INSIDE_CHAR_ERR ; "inside_an_inserted_char")]
+    #[test_case("a\r\nb", 0..4, UNCLEAN_TEXT_ERR ; "over_text_cleaning_would_shrink")]
+    fn a_mark_that_does_not_fit_refuses_its_edit(text: &str, bytes: Range<usize>, err: &str) {
+        let mut buf = TextBuffer::new(String::new());
+        let version = buf.version();
+        let refused = buf
+            .apply_edits(
+                version,
+                vec![text_edit(0, 0, text)],
+                None,
+                None,
+                pushed(vec![chip(bytes)]),
+            )
+            .unwrap_err();
+        assert!(refused.contains(err), "{refused}");
+        assert_eq!((buf.value(), buf.version()), ("", version));
+        assert!(mark_ranges(&buf).is_empty());
+    }
+
+    /// Offsets passed with the text count its bytes as sent, which cleaning
+    /// would move under them. Even no marks at all is refused, so the rule
+    /// is just whether any of them was given.
+    #[test_case(Some(1), None, None ; "a_cursor")]
+    #[test_case(None, Some(0), None ; "an_anchor")]
+    #[test_case(None, None, Some(Vec::new()) ; "an_empty_mark_list")]
+    fn unclean_text_next_to_offsets_is_refused(
+        cursor: Option<usize>,
+        anchor: Option<usize>,
+        marks: Option<Vec<Mark>>,
+    ) {
+        let mut buf = TextBuffer::new(String::new());
+        let version = buf.version();
+        let refused = buf
+            .apply_edits(
+                version,
+                vec![text_edit(0, 0, "a\tb")],
+                cursor,
+                anchor,
+                marks.and_then(pushed),
+            )
+            .unwrap_err();
+        assert!(refused.contains(UNCLEAN_TEXT_ERR), "{refused}");
+        assert_eq!((buf.value(), buf.version()), ("", version));
+    }
+
+    /// Planned before the user typed, so the mark moves past what was typed
+    /// like the cursor of a cursor-only call does.
+    #[test]
+    fn no_edits_with_marks_place_them_and_leave_the_text_and_cursor() {
+        let mut buf = TextBuffer::new(PLANNED_ON.into());
+        let planned = buf.version();
+        buf.set_cursor(0, 0);
+        buf.insert_text("oh ");
+        let (before, cursor, steps) = (buf.version(), buf.cursor_byte(), buf.undo.steps.len());
+
+        let (caret, _) = buf
+            .apply_edits(planned, vec![], None, None, pushed(vec![chip(6..11)]))
+            .unwrap();
+
+        assert_eq!(caret, cursor);
+        assert_eq!(buf.cursor_byte(), cursor);
+        assert_eq!(mark_ranges(&buf), vec![9..14]);
+        assert_eq!(buf.version(), before);
+        assert_eq!(buf.undo.steps.len(), steps);
+    }
+
+    fn shift(code: KeyCode) -> KeyEvent {
+        key(code, KeyModifiers::SHIFT)
+    }
+
+    #[test_case(&[shift(KeyCode::Left), shift(KeyCode::Left)] => (Some(11), 9) ; "each_motion_stretches_it")]
+    #[test_case(&[shift(KeyCode::Left), shift(KeyCode::Home)] => (Some(11), 0) ; "the_anchor_stays_put")]
+    #[test_case(&[shift(KeyCode::Home), shift(KeyCode::End)] => (None, 11) ; "back_on_the_anchor_selects_nothing")]
+    #[test_case(&[shift(KeyCode::Left), plain(KeyCode::Left)] => (None, 9) ; "a_plain_motion_drops_it")]
+    fn shift_motions_select_from_where_the_cursor_was(keys: &[KeyEvent]) -> (Option<usize>, usize) {
+        let mut buf = TextBuffer::new(PLANNED_ON.into());
+        buf.move_to_end();
+        for &key in keys {
+            buf.handle_motion_key(key, key.modifiers.contains(KeyModifiers::SHIFT));
+        }
+        (buf.anchor(), buf.cursor_byte())
+    }
+
+    /// Whatever the keys would remove on their own, with text selected they
+    /// take just the selection. One undo brings back the text and the
+    /// selection, even after more typing joined the step.
+    #[test_case(5, plain(KeyCode::Home), &[plain(KeyCode::Char('h')), plain(KeyCode::Char('i'))] => ("hi world".to_owned(), 2) ; "typing_replaces_it")]
+    #[test_case(5, plain(KeyCode::Home), &[plain(KeyCode::Backspace)] => (" world".to_owned(), 0) ; "backspace_at_the_very_start_deletes_it")]
+    #[test_case(6, plain(KeyCode::End), &[plain(KeyCode::Delete)] => ("hello ".to_owned(), 6) ; "delete_at_the_very_end_deletes_it")]
+    #[test_case(11, alt(KeyCode::Left), &[ctrl(KeyCode::Char('w'))] => ("hello ".to_owned(), 6) ; "a_word_kill_takes_only_the_selection")]
+    fn keys_that_edit_replace_the_selection(
+        from: usize,
+        motion: KeyEvent,
+        edits: &[KeyEvent],
+    ) -> (String, usize) {
+        let mut buf = TextBuffer::new(PLANNED_ON.into());
+        buf.place_cursor(from);
+        buf.handle_motion_key(motion, true);
+        let selected = buf.selection();
+        for &edit in edits {
+            buf.handle_key(edit);
+        }
+        let edited = (buf.value().to_owned(), buf.cursor_byte());
+        assert_eq!(buf.selection(), None);
+
+        assert!(buf.undo());
+        assert_eq!((buf.value(), buf.selection()), (PLANNED_ON, selected));
+        assert!(!buf.undo());
+        edited
+    }
+
+    /// Typing or pasting over every byte a plugin wrote leaves none of them,
+    /// so the text is the user's. Undo brings it back as the plugin's.
+    #[test_case(0, |b| type_keys(b, "x")   => true  ; "typing_over_all_of_it")]
+    #[test_case(0, |b| b.insert_text("x")  => true  ; "pasting_over_all_of_it")]
+    #[test_case(1, |b| type_keys(b, "x")   => false ; "typing_over_part_of_it")]
+    fn a_user_edit_over_the_whole_text_makes_it_the_users(
+        from: usize,
+        edit: fn(&mut TextBuffer),
+    ) -> bool {
+        let mut buf = TextBuffer::new(PLANNED_ON.into());
+        buf.add_writer(&PluginReach::new(PluginPermissions::trusted()));
+        buf.place_cursor(from);
+        buf.handle_motion_key(plain(KeyCode::End), true);
+        edit(&mut buf);
+        let users = buf.writers().is_empty();
+        assert!(buf.undo());
+        assert!(!buf.writers().is_empty());
+        users
+    }
+
+    /// Bold around `world`, the selection kept on the word, the way a Ctrl+B
+    /// plugin writes it.
+    #[test_case(Some(8), |_| {} => Ok(Some(8..13)) ; "selects_what_it_names")]
+    #[test_case(Some(8), |b| { b.set_cursor(0, 0); b.insert_text("oh ") } => Ok(Some(11..16)) ; "mapped_past_typing_before_it")]
+    #[test_case(Some(10), |b| b.replace_byte_range(7, 9, "X", None).unwrap() => matches Err(e) if e.starts_with(CURSOR_CONFLICT_ERR) ; "refused_inside_text_changed_since")]
+    #[test_case(None, |b| { b.handle_motion_key(plain(KeyCode::End), true); } => Ok(None) ; "none_drops_the_selection")]
+    fn an_edit_selects_from_its_anchor(
+        anchor: Option<usize>,
+        user: fn(&mut TextBuffer),
+    ) -> Result<Option<Range<usize>>, String> {
+        let mut buf = TextBuffer::new(PLANNED_ON.into());
+        let planned = buf.version();
+        user(&mut buf);
+        let wrap = vec![text_edit(6, 6, "**"), text_edit(11, 11, "**")];
+        buf.apply_edits(planned, wrap, Some(13), anchor, None)?;
+        Ok(buf.selection())
+    }
+
+    #[test_case(12 => Some(4..12) ; "anchor_before_the_cursor_goes_to_the_start")]
+    #[test_case(0 => Some(0..8) ; "anchor_after_the_cursor_goes_to_the_end")]
+    fn an_anchor_inside_an_atomic_range_takes_it_whole(cursor: usize) -> Option<Range<usize>> {
+        const INSIDE_CHIP: usize = 6;
+        let mut buf = marked("say CHIP now", 4..8, Kind::Atomic, 0);
+        buf.apply_edits(
+            buf.version(),
+            vec![text_edit(12, 12, "!")],
+            Some(cursor),
+            Some(INSIDE_CHIP),
+            None,
+        )
+        .unwrap();
+        buf.selection()
     }
 }

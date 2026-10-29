@@ -76,6 +76,8 @@ Tools that never declare permission scopes (for example `read`, `glob`, `grep`, 
 
 Container tools like `batch` and `code_execution` prompt for each inner tool individually.
 
+Inside `code_execution`, `open()` goes through the `read` and `write` tools, so their rules apply. Metadata and listings (`os.stat`, `os.walk`, `Path.glob`) need the `list` tool and never prompt. Creating a directory also needs `list`, and works only where `write` would run without a prompt. Removing and renaming files needs `bash`.
+
 ## TOML Configuration
 
 There are two permission files:
@@ -234,15 +236,17 @@ Lua plugins have a separate, unrelated gate. A `plugin.toml` manifest next to th
 It runs after [folder trust](/docs/folder-trust/) has let the Lua file load, and
 limits which APIs the file reaches rather than sandboxing the file.
 
+A plugin that changes the chat input needs `input`, and changing its text also needs `agent` and `session_write`, since Enter sends it. `maki.ui.input_edit` needs `session_read` as well. Enter refuses a `/` command or a `!` line when a plugin that wrote it may not run it itself, see [chat input](/docs/lua-api/#chat-input).
+
 ### Session permissions
 
 Three keys cover the session APIs, split by what a call does to the transcript:
 
-- `session_read`: any call that reads what the conversation says, such as `maki.session.export`, `maki.session.messages` and `maki.ui.input`.
+- `session_read`: any call that reads what the conversation says, such as `maki.session.export`, `maki.session.messages`, `maki.ui.input` and `maki.ui.input_edit`. It also covers `ev.input` and `ev.text` in a key handler, and a key binding on a key that types text, in any mode.
 - `session_write`: any call that adds to, removes, or creates conversation content, such as `new`, `prompt`, `notify`, `delete` and `maki.task.remove`.
 - `session_settings`: any call that changes how a session runs without touching its content, such as `set_mode`, `set_title` and `maki.model.set`.
 
-`maki.session.read`, `list`, `live`, `current` and `focus` need none of them. A call that also starts a turn, such as `prompt`, needs `agent` as well. `maki.api.run_command` follows the same rules. The [commands page](/docs/commands/#plugin-access) lists what each command needs.
+`maki.session.read`, `list`, `live`, `current` and `focus` need none of them. A call that also starts a turn, such as `prompt`, needs `agent` as well. So does `new` with a user turn that starts with `/` or `!`, or is `exit`. `maki.api.run_command` follows the same rules. The [commands page](/docs/commands/#plugin-access) lists what each command needs.
 
 A plugin without `session_read` still receives events, with only their metadata fields. That leaves out `data.text` on `TurnStart` and `InputChanged`, `data.input` on `ToolDone`, and `data.summary` on `CompactionDone`. Maki warns once per plugin and event, naming the event and the keys left out. Events a plugin fires under its own names arrive as fired.
 

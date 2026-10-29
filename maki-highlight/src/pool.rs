@@ -20,8 +20,9 @@ use std::any::Any;
 use std::cell::Cell;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::sync::OnceLock;
-use std::thread;
+use std::thread::{self, Result as ThreadResult};
 
+use flume::{Receiver, RecvError};
 use tracing::error;
 
 const UNKNOWN_PANIC: &str = "<non-string panic payload>";
@@ -68,11 +69,30 @@ pub fn run<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
     if ON_HIGHLIGHT_THREAD.get() {
         return f();
     }
+    receive_result(submit(f).recv())
+}
+
+/// Waits without occupying a blocking worker. Dropping the future discards
+/// queued work; a job already running cannot be interrupted.
+pub async fn run_async<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+    if ON_HIGHLIGHT_THREAD.get() {
+        return f();
+    }
+    receive_result(submit(f).recv_async().await)
+}
+
+fn submit<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Receiver<ThreadResult<T>> {
     let (done_tx, done_rx) = flume::bounded(1);
     spawn(move || {
-        let _ = done_tx.send(catch_unwind(AssertUnwindSafe(f)));
+        if !done_tx.is_disconnected() {
+            let _ = done_tx.send(catch_unwind(AssertUnwindSafe(f)));
+        }
     });
-    match done_rx.recv() {
+    done_rx
+}
+
+fn receive_result<T>(result: Result<ThreadResult<T>, RecvError>) -> T {
+    match result {
         Ok(Ok(value)) => value,
         Ok(Err(payload)) => resume_unwind(payload),
         Err(_) => panic!("{THREAD_GONE}"),
@@ -85,14 +105,48 @@ pub fn spawn(f: impl FnOnce() + Send + 'static) {
 
 #[cfg(test)]
 mod tests {
+    use std::future::Future;
+    use std::panic::catch_unwind;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Context, Poll, Waker};
+    use std::thread;
 
-    use super::*;
+    use test_case::test_case;
+
+    use super::{panic_message, run, run_async, spawn};
 
     const PAYLOAD: usize = 41;
     const WAITERS: usize = 8;
     const BOOM: &str = "boom";
+
+    #[test_case(true; "cancelled")]
+    #[test_case(false; "awaited")]
+    fn dropped_async_waiter_discards_queued_work(cancel: bool) {
+        let (release_tx, release_rx) = flume::bounded::<()>(1);
+        spawn(move || {
+            let _ = release_rx.recv();
+        });
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&calls);
+        let mut pending = Box::pin(run_async(move || {
+            count.fetch_add(1, Ordering::SeqCst);
+            PAYLOAD
+        }));
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(pending.as_mut().poll(&mut context).is_pending());
+        if cancel {
+            drop(pending);
+            release_tx.send(()).unwrap();
+            run(|| ());
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+        } else {
+            release_tx.send(()).unwrap();
+            run(|| ());
+            assert_eq!(pending.as_mut().poll(&mut context), Poll::Ready(PAYLOAD));
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+        }
+    }
 
     #[test]
     fn runs_job_and_returns_value() {

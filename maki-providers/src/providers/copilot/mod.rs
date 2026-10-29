@@ -98,7 +98,9 @@ fn create_with_auth(
 
 inventory::submit!(SPEC.config_row());
 const GRAPHQL_QUERY: &str = "query { viewer { copilotEndpoints { api } } }";
-const API_VERSION_HEADER: &str = "2025-10-01";
+/// Also pins the `/models` shape: `2025-10-01` leaves out `billing.token_prices`,
+/// and by `2026-07-01` its `cache_price` is called `cache_read_price`.
+const API_VERSION_HEADER: &str = "2026-08-01";
 const EDITOR_VERSION_HEADER: &str = concat!("Maki/", env!("CARGO_PKG_VERSION"));
 /// Without it the gateway falls back to the `copilot-language-server`
 /// integrator, which intermittently rejects newer models such as gpt-6-luna.
@@ -437,7 +439,9 @@ struct CopilotTokenPriceTier {
     #[serde(default)]
     output_price: f64,
     #[serde(default)]
-    cache_price: f64,
+    cache_read_price: f64,
+    cache_write_price: Option<f64>,
+    max_prompt_tokens: Option<u32>,
 }
 
 impl CopilotModel {
@@ -454,7 +458,7 @@ impl CopilotModel {
         let reasoning = self.reasoning_info();
         ModelInfo {
             id: self.id.clone(),
-            context_window: self.capabilities.limits.max_context_window_tokens,
+            context_window: self.context_window(),
             max_output_tokens: self.capabilities.limits.max_output_tokens,
             pricing: self.pricing(),
             supports_thinking: Some(self.supports_thinking()),
@@ -502,11 +506,25 @@ impl CopilotModel {
         }
     }
 
+    /// `max_context_window_tokens` spans the long-context tier where a model
+    /// has one; the default tier's window is its prompt cap plus the output.
+    fn context_window(&self) -> Option<u32> {
+        let limits = &self.capabilities.limits;
+        self.billing
+            .token_prices
+            .as_ref()
+            .and_then(|prices| prices.default.as_ref())
+            .and_then(|default| default.max_prompt_tokens)
+            .zip(limits.max_output_tokens)
+            .map(|(prompt, output)| prompt.saturating_add(output))
+            .or(limits.max_context_window_tokens)
+    }
+
     /// `/models` reports prices in AI credits per billing batch (1 credit =
-    /// $0.01), scaled to USD per 1M tokens for [`ModelPricing`]. The endpoint
-    /// exposes only the default context tier and cached-input reads; cache
-    /// writes are inherited from the static spec by id prefix so cost
-    /// accounting matches the offline path.
+    /// $0.01), scaled to USD per 1M tokens for [`ModelPricing`]. Only the
+    /// default context tier is read. A model without a cache write price
+    /// inherits it from the static spec by id prefix, so cost accounting
+    /// matches the offline path.
     fn pricing(&self) -> Option<ModelPricing> {
         let token_prices = self.billing.token_prices.as_ref()?;
         let default = token_prices.default.as_ref()?;
@@ -515,14 +533,19 @@ impl CopilotModel {
             return None;
         }
         let usd_per_million = AIC_TO_USD_PER_MILLION / batch_size;
-        let manifest_cache_write = lookup_entry(SPEC.models(), &self.id)
-            .and_then(|entry| entry.pricing.as_ref())
-            .map_or(0.0, |pricing| pricing.cache_write);
+        let cache_write = default.cache_write_price.map_or_else(
+            || {
+                lookup_entry(SPEC.models(), &self.id)
+                    .and_then(|entry| entry.pricing.as_ref())
+                    .map_or(0.0, |pricing| pricing.cache_write)
+            },
+            |price| price * usd_per_million,
+        );
         Some(ModelPricing::per_million(
             default.input_price * usd_per_million,
             default.output_price * usd_per_million,
-            manifest_cache_write,
-            default.cache_price * usd_per_million,
+            cache_write,
+            default.cache_read_price * usd_per_million,
         ))
     }
 
@@ -1056,11 +1079,11 @@ mod tests {
     #[test]
     fn token_prices_convert_aic_per_batch_to_usd_per_million() {
         let model: CopilotModel = serde_json::from_value(json!({
-            "id": "gpt-5",
+            "id": "claude-opus-5",
             "billing": {
                 "token_prices": {
                     "batch_size": 500_000,
-                    "default": {"input_price": 500.0, "output_price": 3000.0, "cache_price": 50.0}
+                    "default": {"input_price": 500.0, "output_price": 3000.0, "cache_read_price": 50.0, "cache_write_price": 62.5}
                 }
             }
         }))
@@ -1070,7 +1093,20 @@ mod tests {
         assert_eq!(pricing.input, 10.0);
         assert_eq!(pricing.output, 60.0);
         assert_eq!(pricing.cache_read, 1.0);
+        assert_eq!(pricing.cache_write, 1.25);
         assert!(pricing.fast.is_none());
+    }
+
+    #[test_case(json!({"max_context_window_tokens": 1_000_000, "max_output_tokens": 128_000}), json!({"batch_size": 1_000_000, "default": {"max_prompt_tokens": 200_000}}) => Some(328_000) ; "default_tier")]
+    #[test_case(json!({"max_context_window_tokens": 200_000, "max_output_tokens": 64_000}), Value::Null => Some(200_000) ; "no_tiers")]
+    fn context_window_is_the_default_tier(limits: Value, token_prices: Value) -> Option<u32> {
+        let model: CopilotModel = serde_json::from_value(json!({
+            "id": "claude-opus-5.5",
+            "capabilities": {"type": "chat", "limits": limits},
+            "billing": {"token_prices": token_prices}
+        }))
+        .unwrap();
+        model.model_info().context_window
     }
 
     #[test]
@@ -1081,7 +1117,7 @@ mod tests {
                 "billing": {
                     "token_prices": {
                         "batch_size": 500_000,
-                        "default": {"input_price": 250.0, "output_price": 1250.0, "cache_price": 25.0}
+                        "default": {"input_price": 250.0, "output_price": 1250.0, "cache_read_price": 25.0}
                     }
                 }
             })
@@ -1115,7 +1151,7 @@ mod tests {
     }
 
     #[test_case(json!({"id": "gpt-5"}) ; "no billing")]
-    #[test_case(json!({"id": "gpt-5", "billing": {"token_prices": {"batch_size": 0, "default": {"input_price": 1.0, "output_price": 1.0, "cache_price": 0.1}}}}) ; "zero batch size")]
+    #[test_case(json!({"id": "gpt-5", "billing": {"token_prices": {"batch_size": 0, "default": {"input_price": 1.0, "output_price": 1.0, "cache_read_price": 0.1}}}}) ; "zero batch size")]
     fn pricing_falls_back_when_billing_unusable(billing: Value) {
         let model: CopilotModel = serde_json::from_value(billing).unwrap();
         assert!(model.pricing().is_none());

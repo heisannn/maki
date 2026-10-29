@@ -1,0 +1,123 @@
+{
+  $schema: 'https://docs.renovatebot.com/renovate-schema.json',
+  extends: [
+    'config:recommended',
+    'helpers:pinGitHubActionDigestsToSemver',
+    'customManagers:githubActionsVersions',
+  ],
+  // Commits are chore(deps) by default and fix(deps) for security fixes, not fix(deps) by depType.
+  ignorePresets: [':semanticPrefixFixDepsChoreOthers'],
+  schedule: ['* * * * 1'],
+  labels: ['dependencies'],
+  osvVulnerabilityAlerts: true,
+  vulnerabilityAlerts: {
+    // Applied as `force`, so it wins over the rule that turns in-range crate updates off.
+    enabled: true,
+    addLabels: ['security'],
+    semanticCommitType: 'fix',
+  },
+  cargo: {
+    // Transitive crates (most advisories) only move through this weekly `cargo update`.
+    lockFileMaintenance: {
+      enabled: true,
+      schedule: ['* * * * 1'],
+      commitMessageAction: 'update',
+      commitMessageTopic: 'Cargo.lock',
+    },
+  },
+  nix: {
+    // Inputs carry no rev in flake.nix, so lock maintenance is the only update the nix manager makes.
+    enabled: true,
+    lockFileMaintenance: {
+      enabled: true,
+      schedule: ['* * 1 * *'],
+      branchTopic: 'nix-lock-file-maintenance',
+      commitMessageAction: 'update',
+      commitMessageTopic: 'flake.lock',
+    },
+  },
+  customManagers: [
+    {
+      customType: 'regex',
+      description: "Copilot's API version has no listing, so follow the one opencode pins",
+      managerFilePatterns: ['/^maki-providers/src/providers/copilot/mod\\.rs$/'],
+      matchStrings: ['const API_VERSION_HEADER: &str = "(?<currentValue>\\d{4}-\\d{2}-\\d{2})";'],
+      depNameTemplate: 'copilot-api-version',
+      datasourceTemplate: 'custom.copilot-api-version',
+      versioningTemplate: 'regex:^(?<major>\\d{4})-(?<minor>\\d{2})-(?<patch>\\d{2})$',
+    },
+  ],
+  customDatasources: {
+    'copilot-api-version': {
+      defaultRegistryUrlTemplate: 'https://raw.githubusercontent.com/anomalyco/opencode/dev/packages/core/src/plugin/provider/github-copilot.ts',
+      format: 'plain',
+      // Every line of the file comes in as a release. Keep the one that pins the version, and return
+      // nothing when it's gone, so a rename on their side fails the lookup instead of going quiet.
+      transformTemplates: [
+        '($pins := releases[$match(version, /^const apiVersion = "\\d{4}-\\d{2}-\\d{2}"$/)]; $count($pins) = 1 ? {"releases": [{"version": $match($pins.version, /\\d{4}-\\d{2}-\\d{2}/).match}]} : {})',
+      ],
+    },
+  },
+  packageRules: [
+    {
+      description: 'In-range crate updates come with the weekly Cargo.lock PR',
+      matchManagers: ['cargo'],
+      matchJsonata: ['isLockfileUpdate = true'],
+      enabled: false,
+    },
+    {
+      description: 'Breaking crate updates (0.x minors too) usually need code changes',
+      matchManagers: ['cargo'],
+      matchIsBreaking: true,
+      dependencyDashboardApproval: true,
+    },
+    {
+      description: 'One PR for grammar bumps instead of one per grammar',
+      matchManagers: ['cargo'],
+      matchPackageNames: ['tree-sitter-*'],
+      groupName: 'tree-sitter grammars',
+    },
+    {
+      matchManagers: ['github-actions'],
+      groupName: 'GitHub Actions',
+      schedule: ['* * 1 * *'],
+    },
+    {
+      description: 'Only tags bare majors (v35), which the semver extractVersion of the pin preset drops',
+      matchPackageNames: ['nixbuild/nix-quick-install-action'],
+      extractVersion: '^(?<version>v\\d+)$',
+    },
+    {
+      matchManagers: ['custom.regex'],
+      schedule: ['* * 1 * *'],
+    },
+    {
+      description: 'Weekly, unlike the other custom deps. The PR only moves the date, so the new /models shape needs a look before merging',
+      matchDepNames: ['copilot-api-version'],
+      schedule: ['* * * * 1'],
+      prBodyNotes: ['Check that `/models` still parses with this version (`billing.token_prices`, `capabilities.limits`) before merging.'],
+    },
+    {
+      matchManagers: ['custom.regex'],
+      matchDepNames: ['ruff', 'ty'],
+      groupName: 'ruff and ty',
+    },
+    {
+      description: 'Pinned to a nightly until a stable release has luau-lang/lute#1234',
+      matchDepNames: ['luau-lang/lute'],
+      allowedVersions: '!/-nightly\\./',
+    },
+    {
+      description: 'release.yml only runs on tags and no PR workflow covers it, so these wait until someone can cut a test release',
+      matchManagers: ['custom.regex'],
+      matchFileNames: ['.github/workflows/release.yml'],
+      dependencyDashboardApproval: true,
+    },
+    {
+      description: 'Docker tag timestamps restart on every rebuild, so docker stays out',
+      matchDatasources: ['crate', 'pypi', 'github-releases', 'github-tags', 'forgejo-tags'],
+      matchUpdateTypes: ['major', 'minor', 'patch'],
+      minimumReleaseAge: '7 days',
+    },
+  ],
+}

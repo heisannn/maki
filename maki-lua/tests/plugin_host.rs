@@ -24,9 +24,9 @@ use maki_config::{
     ThinkingLines, ToolKey, ToolOutputLines,
 };
 use maki_lua::{
-    InitFiles, Interaction, KEY_WARNING, MAX_INFLIGHT_TOOLS, Missing, NO_UI_ERR,
-    PERMISSION_NAME_WARNING, PluginError, PluginHost, PluginPermissions, SKIPPED_PLUGIN_WARNING,
-    SessionEndReason, WARM_TOOL_CAP, set_allowed_private_hosts,
+    InitFiles, Interaction, KEY_WARNING, MAX_INFLIGHT_TOOLS, NO_UI_ERR, PERMISSION_NAME_WARNING,
+    PluginError, PluginHost, PluginPermissions, SKIPPED_PLUGIN_WARNING, SessionEndReason,
+    WARM_TOOL_CAP, set_allowed_private_hosts,
 };
 use maki_providers::provider::{BoxFuture, Provider};
 use maki_providers::{
@@ -39,6 +39,17 @@ use rustix::process::{Pid, test_kill_process_group};
 use serde_json::{Value, json};
 
 const BUILTIN_COMMANDS: &[&str] = &["/sessions", "/rename", "/tasks"];
+const BASH_HIGHLIGHT_TIMEOUT_SECS: u64 = 10;
+const BASH_HIGHLIGHT_COMMAND: &str = "printf ready";
+const BASH_HIGHLIGHT_OUTPUT: &str = "ready";
+const BASH_PARKED_HIGHLIGHT_SRC: &str = r#"
+local gate = maki.async.semaphore(1)
+maki.ui.highlight = function()
+    local held = gate:acquire()
+    gate:acquire()
+    held:release()
+end
+"#;
 const NARGS_ERR: &str = r#"'nargs' must be 0, 1, "?", "*", or "+""#;
 const GLOBAL_PACK_ONLY_ERR: &str = "only available in the global init.lua";
 const USAGE_TOOL_NAME: &str = "usage_child";
@@ -262,6 +273,7 @@ const TIMED_OUT_SUBSTR: &str = "timed out";
 const ALREADY_CALLED_ERR: &str = "already called";
 const UNKNOWN_FIELD_ERR: &str = "unknown field";
 const PERMISSION_DENIED_MSG: &str = "permission denied";
+const NOT_GRANTED: &str = "not granted for this plugin";
 
 #[test]
 fn stdlib_globals_accessible() {
@@ -5401,6 +5413,34 @@ const BASH_PARTIAL_MARKER_TAIL: &str = ", output above is partial]";
 const BASH_PARTIAL_PROBE: &str = "XY";
 const BASH_PARTIAL_CMD: &str = "printf '%s%s\\n' X Y && sleep 30";
 
+#[test_case::test_case(BASH_HIGHLIGHT_COMMAND ; "parked_highlighter")]
+fn bash_finishes_without_waiting_for_highlighting(command: &str) {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_source(
+        "bash",
+        &format!(
+            "{BASH_PARKED_HIGHLIGHT_SRC}\n{}",
+            include_str!("../../plugins/bash/init.lua")
+        ),
+    )
+    .unwrap();
+    let (trigger, token) = CancelToken::new();
+    let mut ctx = maki_agent::tools::test_support::stub_ctx(&AgentMode::Build);
+    ctx.config.rtk = false;
+    ctx.cancel = token;
+
+    let result = exec_with_ctx(
+        &reg,
+        "bash",
+        json!({ "command": command, "timeout": BASH_HIGHLIGHT_TIMEOUT_SECS }),
+        &ctx,
+    );
+    trigger.cancel();
+
+    assert_eq!(result.as_deref(), Ok(BASH_HIGHLIGHT_OUTPUT));
+}
+
 /// Esc mid-stream on a real bash run: the lines printed so far come back as
 /// an error reply ending in the marker, not a bare "cancelled".
 #[test]
@@ -5755,7 +5795,7 @@ fn run_call_with(held: &[Permission], call: &str) -> String {
 #[test_case::test_case(r#"maki.session.new({ prompt = "go" })"#, &[Permission::SessionWrite], Permission::Agent ; "new_with_a_prompt_with_only_write")]
 fn session_calls_need_their_own_permission(call: &str, held: &[Permission], missing: Permission) {
     let result = run_call_with(held, call);
-    let refusal = Missing::Permission(missing).to_string();
+    let refusal = format!("'{missing}' {NOT_GRANTED}");
     assert!(result.contains(&refusal), "got: {result}");
 }
 
@@ -5899,26 +5939,46 @@ fn pure_functions_not_guarded() {
     assert!(result.contains("json=true"), "got: {result}");
 }
 
+/// All plugins share one VM, so a tool that runs it out of memory must fail
+/// alone and leave enough room for the tools that come after it. The hog
+/// yields as it grows, so a slow machine hits the memory limit, not the
+/// watchdog for a blocked Lua thread.
 #[test]
-fn runaway_allocation_hits_memory_limit_instead_of_oom() {
-    const LIMITED: &str = "limited";
-    let src = r#"
-        local ok, err = pcall(function()
-            local t = {}
-            local chunk = string.rep("x", 1024 * 1024)
-            while true do
-                t[#t + 1] = chunk .. tostring(#t)
-            end
-        end)
-        if ok then error("expected allocation to fail under the memory limit") end
-        if not string.find(tostring(err), "memory") then
-            error("expected an out-of-memory error, got: " .. tostring(err))
-        end
-    "#;
+fn out_of_memory_tool_fails_alone() {
+    const AFTER_BYTES: usize = 1024 * 1024;
+    let src = format!(
+        r#"
+        maki.api.register_tool({{
+            name = "hog",
+            description = "d",
+            schema = {MINIMAL_SCHEMA},
+            handler = function()
+                local t = {{}}
+                local chunk = string.rep("x", 1024 * 1024)
+                while true do
+                    t[#t + 1] = chunk .. tostring(#t)
+                    maki.async.sleep(0)
+                end
+            end,
+        }})
+        maki.api.register_tool({{
+            name = "after",
+            description = "d",
+            schema = {MINIMAL_SCHEMA},
+            handler = function()
+                return tostring(#string.rep("y", {AFTER_BYTES}))
+            end,
+        }})
+    "#
+    );
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
-    host.load_source(LIMITED, src)
-        .expect("plugin should hit the memory limit and recover, not crash the process");
+    host.load_source("oom", &src).unwrap();
+
+    let hog = exec_tool(&reg, "hog", serde_json::json!({})).unwrap_err();
+    assert!(hog.contains("memory"), "got: {hog}");
+    let after = exec_tool(&reg, "after", serde_json::json!({}));
+    assert_eq!(after, Ok(AFTER_BYTES.to_string()));
 }
 
 #[test]
@@ -6215,6 +6275,86 @@ fn interpreter_tools_gather_resolves_parallel_batch() {
     host.load_source("interp_gather_plugin", &src).unwrap();
     let out = exec_tool(&reg, "interp_gather", serde_json::json!({})).unwrap();
     assert_eq!(out, "A|B");
+}
+
+const MKDIR_REFUSED: &str = "mkdir refused";
+const READ_NOT_CONTENT: &str = "expected string";
+
+fn interp_files_plugin(name: &str, python: &str) -> String {
+    format!(
+        r#"maki.api.register_tool({{
+            name = "{name}",
+            description = "test",
+            schema = {MINIMAL_SCHEMA},
+            audiences = {{ "main" }},
+            handler = function(input, ctx)
+                local lines = {{}}
+                local result, err = maki.interpreter.run("{python}", {{
+                    timeout = 10,
+                    max_memory_mb = 50,
+                    on_output = function(line) table.insert(lines, line) end,
+                    files = {{
+                        read = function(path) return true end,
+                        inspect = function(path) return true end,
+                        mkdir = function(path, parents)
+                            return nil, "{MKDIR_REFUSED} " .. path .. " " .. tostring(parents)
+                        end,
+                    }},
+                }})
+                if err then return "err: " .. err end
+                return table.concat(lines, "|")
+            end
+        }})"#
+    )
+}
+
+#[test]
+fn interpreter_files_inspect_and_mkdir_reach_lua() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let src = interp_files_plugin(
+        "interp_files",
+        r"import os\nprint(os.path.isdir('.'))\ntry:\n    os.makedirs('maki-never-created/x')\nexcept OSError as e:\n    print(e)",
+    );
+    host.load_source("interp_files_plugin", &src).unwrap();
+    let out = exec_tool(&reg, "interp_files", serde_json::json!({})).unwrap();
+    let made = out
+        .strip_prefix(&format!("True|{MKDIR_REFUSED} "))
+        .and_then(|rest| rest.strip_suffix(" true"));
+    let expected = std::env::current_dir()
+        .unwrap()
+        .join("maki-never-created/x");
+    assert!(
+        made.is_some_and(|made| Path::new(made) == expected),
+        "got: {out}"
+    );
+}
+
+/// From `read`, a `(true)` ack would pass for an empty file.
+#[test]
+fn interpreter_files_read_must_return_content() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let src = interp_files_plugin(
+        "interp_read_ack",
+        r"try:\n    open('x').read()\nexcept OSError as e:\n    print(e)",
+    );
+    host.load_source("interp_read_ack_plugin", &src).unwrap();
+    let out = exec_tool(&reg, "interp_read_ack", serde_json::json!({})).unwrap();
+    assert!(out.contains(READ_NOT_CONTENT), "got: {out}");
+}
+
+/// `inspect` lets the sandbox read the disk, so it takes `fs_read`.
+#[test]
+fn interpreter_inspect_needs_fs_read() {
+    let src = interp_files_plugin("interp_no_read", "1");
+    let perms = PluginPermissions::from_approved([Permission::Run.manifest_key()]);
+    let err =
+        exec_tool_with_perms(perms, &src, "interp_no_read", serde_json::json!({})).unwrap_err();
+    assert!(
+        err.contains(Permission::FsRead.manifest_key()),
+        "got: {err}"
+    );
 }
 
 const NESTED_DEPTH_TOOL: &str = "nested_depth";
@@ -6800,6 +6940,34 @@ mod read_tool_required_params {
             )),
             "explicit limit must be clamped to the cap, got: {out}"
         );
+    }
+
+    /// Reading the whole file used to fill the 512 MiB Lua heap that every
+    /// plugin shares. The file is sparse, so the test stays cheap.
+    #[cfg(unix)]
+    #[test]
+    fn file_bigger_than_lua_heap_with_one_huge_line() {
+        const HEAD: &str = "first\nsecond\n";
+        const OVER_LUA_HEAP: u64 = 600 * 1024 * 1024;
+        const DEFAULT_MAX_LINE_BYTES: usize = 500;
+        let (reg, _host) = builtins_host();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("huge.log");
+        std::fs::write(&path, HEAD).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(OVER_LUA_HEAP)
+            .unwrap();
+
+        let out = exec_tool(
+            &reg,
+            "read",
+            serde_json::json!({ "path": path.to_str().unwrap(), "offset": 2, "limit": 2 }),
+        );
+        let huge_line_cut = "\0".repeat(DEFAULT_MAX_LINE_BYTES);
+        assert_eq!(out, Ok(format!("2: second\n3: {huge_line_cut}...")));
     }
 
     #[test]
@@ -8458,4 +8626,176 @@ fn a_ctx_session_pays_for_reach_whoever_could_answer(answerable: bool) {
         panic!("unexpected output: {result:?}");
     };
     assert!(text.text.contains("fs_write"), "got: {}", text.text);
+}
+
+/// One plugin process serves every tab, so each window and hint has to say
+/// which tab it is for. A background agent's window should never pop up on
+/// the tab the user is looking at.
+mod session_owned_ui {
+    use super::*;
+
+    const PLUGIN: &str = "owned_ui";
+    const OPEN_TOOL: &str = "open_owned";
+    const HINT_TOOL: &str = "hint_owned";
+    const COMMAND: &str = "/open_owned";
+    const NO_OPEN_WIN: &str = "open_win never reached the UI";
+    const OPEN_WIN_TIMEOUT: Duration = Duration::from_secs(30);
+    const BAD_SESSION_ERR: &str = "open_win: bad session";
+    const UNKNOWN_HINT_OPT_ERR: &str = "\"sesion\"";
+
+    const SRC: &str = r#"
+    local function open(opts)
+        opts = opts or {}
+        opts.focus = false
+        maki.ui.open_win(maki.ui.buf({ scratch = true }), opts)
+    end
+
+    maki.api.register_tool({
+        name = "open_owned",
+        description = "opens a window",
+        schema = {
+            type = "object",
+            properties = { opts = { type = "object" }, deferred = { type = "boolean" } },
+        },
+        handler = function(input)
+            if input.deferred then
+                maki.async.run(function() open(input.opts) end)
+            else
+                open(input.opts)
+            end
+            return ""
+        end,
+    })
+
+    maki.api.register_tool({
+        name = "hint_owned",
+        description = "sets a hint",
+        schema = { type = "object", properties = { opts = { type = "object" } } },
+        handler = function(input)
+            maki.ui.set_status_hint({ { "hint", "" } }, input.opts)
+            return ""
+        end,
+    })
+
+    maki.api.register_command({
+        name = "/open_owned",
+        description = "opens a window",
+        handler = function() open(nil) end,
+    })
+    "#;
+
+    fn host() -> (Arc<ToolRegistry>, PluginHost) {
+        let reg = fresh_registry();
+        let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+        host.load_source(PLUGIN, SRC).unwrap();
+        (reg, host)
+    }
+
+    fn ctx_in(session: MakiId) -> ToolContext {
+        let mut ctx = maki_agent::tools::test_support::stub_ctx(&AgentMode::Build);
+        ctx.session_id = Some(SessionRef::from_id(session));
+        ctx
+    }
+
+    fn for_session(session: impl ToString) -> Value {
+        json!({ "opts": { "session": session.to_string() } })
+    }
+
+    /// Waits, since a `maki.async.run` window opens after the call returns.
+    fn opened_in(host: &PluginHost) -> Option<MakiId> {
+        let rx = host.ui_action_rx();
+        loop {
+            if let maki_lua::UiAction::OpenWin { session, .. } =
+                rx.recv_timeout(OPEN_WIN_TIMEOUT).expect(NO_OPEN_WIN)
+            {
+                return session;
+            }
+        }
+    }
+
+    fn hint_owners(host: &PluginHost) -> Vec<Option<MakiId>> {
+        host.hint_reader()
+            .load_full()
+            .entries
+            .iter()
+            .map(|e| e.session)
+            .collect()
+    }
+
+    #[test_case::test_case(false ; "handler")]
+    #[test_case::test_case(true ; "async_run_under_handler")]
+    fn window_goes_to_the_calling_session(deferred: bool) {
+        let (reg, host) = host();
+        let caller = MakiId::generate();
+
+        let input = json!({ "deferred": deferred });
+        exec_with_ctx(&reg, OPEN_TOOL, input, &ctx_in(caller)).unwrap();
+
+        assert_eq!(opened_in(&host), Some(caller));
+    }
+
+    #[test]
+    fn explicit_session_wins_over_the_caller() {
+        let (reg, host) = host();
+        let named = MakiId::generate();
+
+        exec_with_ctx(
+            &reg,
+            OPEN_TOOL,
+            for_session(named),
+            &ctx_in(MakiId::generate()),
+        )
+        .unwrap();
+
+        assert_eq!(opened_in(&host), Some(named));
+    }
+
+    /// Nothing ties a command to a session, so the UI puts it on the
+    /// focused tab.
+    #[test]
+    fn window_outside_a_tool_call_has_no_owner() {
+        let (_reg, host) = host();
+
+        host.event_handle()
+            .run_command(Arc::from(PLUGIN), Arc::from(COMMAND), String::new(), 0);
+
+        assert_eq!(opened_in(&host), None);
+    }
+
+    /// A typo here would quietly put the window or hint in the wrong tab.
+    #[test_case::test_case(OPEN_TOOL, for_session("not-a-session"), BAD_SESSION_ERR ; "open_win_bad_session")]
+    #[test_case::test_case(HINT_TOOL, json!({ "opts": { "sesion": "x" } }), UNKNOWN_HINT_OPT_ERR ; "hint_unknown_option")]
+    fn bad_session_options_throw(tool: &str, input: Value, expected: &str) {
+        let (reg, _host) = host();
+
+        let err = exec_with_ctx(&reg, tool, input, &ctx_in(MakiId::generate())).unwrap_err();
+
+        assert!(err.contains(expected), "got: {err}");
+    }
+
+    /// Unlike a window, a hint takes no session from the call. One plugin
+    /// would fill one slot from its tool and another from its keymap
+    /// otherwise, and the tab of that call would show both.
+    #[test]
+    fn hint_without_session_shows_in_every_tab_even_from_a_tool_call() {
+        let (reg, host) = host();
+
+        exec_with_ctx(&reg, HINT_TOOL, json!({}), &ctx_in(MakiId::generate())).unwrap();
+
+        assert_eq!(hint_owners(&host), [None]);
+    }
+
+    #[test]
+    fn ending_a_session_takes_only_its_hints() {
+        let (reg, host) = host();
+        let (ended, kept) = (MakiId::generate(), MakiId::generate());
+        for input in [json!({}), for_session(ended), for_session(kept)] {
+            exec_with_ctx(&reg, HINT_TOOL, input, &ctx_in(MakiId::generate())).unwrap();
+        }
+
+        host.event_handle()
+            .end_sessions_blocking([ended], SessionEndReason::Delete);
+
+        assert_eq!(hint_owners(&host), [None, Some(kept)]);
+    }
 }

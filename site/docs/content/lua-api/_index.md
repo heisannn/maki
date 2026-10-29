@@ -57,6 +57,9 @@ a string belongs.
 Sensitive APIs are gated per plugin file, and every gated function's entry in
 this reference names the permission it needs. A gated call without its
 permission raises `permission denied: '<name>' not granted for this plugin`.
+Inside an action of your plugin, a call also raises when the `capability`
+of the action leaves its permission out, see
+`maki.api.register_action`.
 
 - `fs_read`: reading files, and locating the directories maki keeps them in
 - `fs_write`: creating, changing, and removing files
@@ -67,6 +70,7 @@ permission raises `permission denied: '<name>' not granted for this plugin`.
 - `session_read`: reading conversation content: session history, the chat input draft, and the content fields of events
 - `session_write`: adding to, removing, or creating conversation content: new sessions, prompts, notices, and deleting sessions or task transcripts
 - `session_settings`: changing how a session runs without touching its content: mode, title, model, thinking, fast mode, working directory, and workflow
+- `input`: changing the chat input, which is what your next Enter sends
 
 Grants come from a `plugin.toml` next to the Lua file (for
 `~/.config/maki/init.lua` that is `~/.config/maki/plugin.toml`):
@@ -84,6 +88,7 @@ agent = true
 session_read = true
 session_write = true
 session_settings = true
+input = true
 ```
 
 The rules:
@@ -877,11 +882,12 @@ Built-in events fired by the host: `"TurnStart"`, `"TurnEnd"`,
 `"CompactionDone"`, `"PlanReady"`, `"SessionReset"`, `"SessionEnd"`,
 `"SessionFocusChanged"`, `"SessionStatusChanged"`, `"SessionTitleChanged"`,
 `"SessionCwdChanged"`, `"TaskStatusChanged"`, `"TaskStopped"`, `"TaskFocusChanged"`, `"ModelChanged"`, `"InputChanged"`,
-and `"FileIndexReady"`. Plugins can also fire their own events with
-`exec_autocmds`.
+`"ModeChanged"` and `"FileIndexReady"`. Plugins can also fire their own
+events with `exec_autocmds`.
 
 Every host event carries `data.session_id` except `"FileIndexReady"`,
-which is about a directory rather than a session. For `"SessionReset"` and
+which is about a directory rather than a session, and `"ModeChanged"`,
+since the mode is the same in every session. For `"SessionReset"` and
 `"SessionEnd"` that is the session being left behind, the other events
 name the session now running or focused. What each event adds:
 
@@ -934,15 +940,23 @@ name the session now running or focused. What each event adds:
 - `"ModelChanged"`: `data.model` in the shape `maki.model.get` returns,
   plus `data.previous_spec`. Picking the model already in use stays
   quiet, and so does startup.
-- `"InputChanged"`: `data.text`, `data.cursor` and `data.version`, the
-  chat input as `maki.ui.input` reports it. `data.source` is the plugin
-  name when that plugin's `maki.ui.input_edit` was the only writer this
-  frame, and nil otherwise (including when the user moved the caret), so
-  ignoring your own name never drops a change. `data.cursor_only` is true
-  when only the caret moved. Handlers that only care about the text
-  should return early on it. Fires at most once per frame, and only when
-  the text or caret changed. Focusing another session republishes that
-  session's input.
+- `"InputChanged"`: `data.text`, `data.cursor`, `data.anchor`,
+  `data.version` and `data.session_id`, as
+  [`maki.ui.input`](#maki-ui-input) reports them. `data.cursor_only` is
+  true when only the cursor or the selection moved. `data.source` names
+  the plugin whose `maki.ui.input_edit` made the only change since the
+  last `"InputChanged"`, and is nil otherwise, so a handler can skip its
+  own edits. A package goes by its
+  [package name](/docs/packages/#install-from-git), and `init.lua` code
+  by `"global/init.lua"` or `"project/init.lua"`. Fires at most once per
+  screen redraw, and again for the input of a tab that takes focus.
+  [Marks](#input-marks) alone do not fire it, so a handler can call
+  `maki.ui.input_decorate` without looping.
+- `"ModeChanged"`: `data.old_mode` and `data.new_mode`, each `"n"` or
+  `"i"`. Fires whenever `maki.fn.mode()` changes: on `maki.ui.set_mode`,
+  and when the chat input gains or loses the keyboard, as when a picker
+  opens. Use it to draw a mode indicator. Like `"InputChanged"`, it fires
+  only with a UI.
 - `"FileIndexReady"`: `data.root`, the absolute directory that was
   walked, `data.files`, how many paths the walk left, and `data.crashed`
   and `data.truncated`, the two ways that list is not the whole tree.
@@ -1064,6 +1078,75 @@ maki.api.exec_autocmds("MyEvent", {
 
 ---
 
+### `maki.api.register_action()` {#maki-api-register_action}
+
+```lua
+maki.api.register_action({name}, {callback}, {opts?})
+```
+
+Registers {callback} as an action that `maki.ui.action` runs. This is
+how a user's `init.lua` reaches your plugin, since `require` only sees
+the calling plugin's own files.
+
+The action is named after your plugin: `register_action("accept", ...)`
+in a plugin installed as `completion` registers `"completion.accept"`. In
+the global or project `init.lua` the prefix is `user`, like
+`"user.paste_plain"`. A plugin named `user` cannot register actions, so no
+plugin can replace the ones a user's keys call.
+
+The callback runs as your plugin, inside the caller's key handler, and
+`maki.ui.action` returns its value. Return `true` when it handled the
+request, and `false` or nothing so the caller can try something else.
+Registering a name again replaces the callback, and the action goes away
+when your plugin unloads. When both `init.lua` files register a name, the
+project one wins until it is gone.
+
+`opts.capability` is the price of the action: the permissions a caller
+must hold. Without it, the price is every permission your plugin holds.
+With `{}`, any caller gets in, and the callback holds no permission. A
+caller that falls short gets `nil` and an error naming the missing
+permission.
+
+The price also caps the callback, whoever calls it, so list everything
+it uses. A call that needs a permission outside the price fails as it
+would in a plugin without that permission. The cap covers the tasks,
+timers and jobs the callback starts, and the tools, permission rules,
+slot layers and actions it registers. Keymaps and autocmds it sets run
+later with all your grants. Code of other plugins that runs meanwhile,
+like their autocmds, keeps its own grants. For example,
+`completion.accept` writes file paths into the input that Enter then
+sends, so it lists `fs_read`, `input`, `session_read`, `agent` and
+`session_write`.
+
+Also bind a default key for users who do not
+[compose keys](/docs/keybindings/#composing-keys), preferably an Alt chord,
+since your binding [shadows theirs](/docs/keybindings/#overriding-keybindings)
+on the same key.
+
+Throws when `capability` lists a permission your plugin does not hold, or
+when {name} is empty or has a `.`.
+
+**Parameters:**
+
+- `{name}` (`string`) The name after the prefix, like `"accept"`.
+- `{callback}` (`function`) Called with no arguments. Return `true` when handled.
+- `{opts?}` (`table|nil`) `{ capability = { "fs_read", ... } }`: what a caller must hold. Default: every permission your plugin holds.
+
+**Returns:** (`string`) The full name to pass to `maki.ui.action`, like `"completion.accept"`.
+
+**Example:**
+
+```lua
+-- Writes a file path into the input, so a caller must hold what that takes:
+maki.api.register_action("accept", function()
+  if not Menu.open() then return false end
+  Menu.accept()
+  return true
+end, { capability = { "fs_read", "input", "session_read", "agent", "session_write" } })
+```
+
+---
+
 ### `maki.api.declare_slot()` {#maki-api-declare_slot}
 
 ```lua
@@ -1171,7 +1254,9 @@ none, or nothing at all if it declared its arguments inert. Layering a slot
 you declared yourself is free. Like the `tool.*` slots, this is decided
 when the chain fires: the call skips a layer that is not entitled and
 carries on, and a reload that changes what you hold takes effect on the
-next call.
+next call. A layer set inside an
+[action](#maki-api-register_action) callback is weighed against the
+action's price too.
 
 **Parameters:**
 
@@ -1390,7 +1475,9 @@ The returned table has fields: `id` (string), `tier` (string),
 - `{ctx}` (`LuaCtx`) Agent context.
 - `{opts?}` (`table?`) Optional fields:
   - `tier` (`string?`) target tier, e.g. `"fast"`, `"mid"`, `"best"`. Clamped to
-    the parent tier so you cannot escalate.
+    the parent tier so you cannot escalate. Resolved by
+    `maki.model.tier`, so a `/model` pick for the tier wins over the
+    session provider's curated default.
   - `spec` (`string?`) exact model spec string, e.g. `"claude-3-5-haiku-20241022"`.
     Takes precedence over `tier`.
 
@@ -2701,6 +2788,28 @@ the bottom re-pins it so streaming output keeps following.
 maki.fn.winrestview({ topline = 1 })
 ```
 
+---
+
+### `maki.fn.mode()` {#maki-fn-mode}
+
+```lua
+maki.fn.mode()
+```
+
+The current mode, like `vim.fn.mode()`: `"i"` while the chat input has
+the keyboard and takes typed text, `"n"` otherwise. See
+[Modes](/docs/lua-api/#modes). Always `"n"` without a UI.
+
+**Returns:** (`string`) `"n"` or `"i"`.
+
+**Example:**
+
+```lua
+maki.keymap.set({ "n", "i" }, "<M-m>", function()
+  maki.ui.set_mode(maki.fn.mode() == "n" and "i" or "n")
+end)
+```
+
 
 ## maki.fs {#maki-fs}
 
@@ -2724,7 +2833,7 @@ maki.fs.read({path}, {opts?})
 
 Read the file at {path} as a UTF-8 string. Pass {opts} to read only some
 lines, such as the end of a log.
-Returns nil plus an error message if the text read is over 512 MiB or not
+Returns nil plus an error message if the text read is over 64 MiB or not
 valid UTF-8. Skipped lines do not count, so tailing a huge log works.
 Use `read_bytes` for binary files.
 
@@ -2758,7 +2867,7 @@ maki.fs.read_bytes({path}, {opts?})
 
 Read the file at {path} as raw bytes in a Luau buffer. Pass {opts} to read
 a byte range.
-Returns nil plus an error message if the bytes read are over 512 MiB.
+Returns nil plus an error message if the bytes read are over 64 MiB.
 Use it for binary files or data headed for `maki.base64.encode`.
 
 Requires the `fs_read` [plugin permission](#plugin-permissions).
@@ -2777,6 +2886,39 @@ local buf, err = maki.fs.read_bytes("image.png")
 if err then return end
 local encoded = maki.base64.encode(buf)
 local header = maki.fs.read_bytes("image.png", { len = 8 })
+```
+
+---
+
+### `maki.fs.read_lines()` {#maki-fs-read_lines}
+
+```lua
+maki.fs.read_lines({path}, {opts?})
+```
+
+Read a page of lines from the file at {path}, holding only that page, and
+count every line of the file in the same pass. With `max_line_bytes`, a
+file of any size pages fine, even one that is a single huge line.
+Lines come without their `\n` or `\r\n`, and a trailing newline does not
+start a new line: `a\nb\n` has 2 lines.
+Returns nil plus an error message if the page is over 64 MiB or not valid
+UTF-8.
+
+Requires the `fs_read` [plugin permission](#plugin-permissions).
+
+**Parameters:**
+
+- `{path}` (`string`) Absolute or relative file path. `~/` is expanded to the home directory.
+- `{opts?}` (`table?`) `offset` is the 1-based line to start at (default 1). `limit` is the max number of lines, `0` or omitted reads to the end. `max_line_bytes` cuts longer lines at a UTF-8 boundary and appends `...`, omitted or `0` keeps lines whole. `count = false` stops reading after the page and leaves `total` nil.
+
+**Returns:** (`table?`, `string?`) `{ lines = string[], total = integer? }`, or nil plus an error message.
+
+**Example:**
+
+```lua
+local page, err = maki.fs.read_lines("server.log", { offset = 101, limit = 100, max_line_bytes = 500 })
+if err then return end
+print(("lines 101-%d of %d"):format(100 + #page.lines, page.total))
 ```
 
 ---
@@ -3541,13 +3683,25 @@ Requires the `run` [plugin permission](#plugin-permissions).
   - `tools` (`table?`) map of `name -> function` for tools the sandbox may call.
     Each function receives the tool input table and must return `(string)` or
     `(nil, err)`. Tool calls are batched and dispatched concurrently.
-  - `files` (`table?`) serves text file access from `open()` and `pathlib`.
-    `read(path)` returns `(content)`, `write(path, content, append)` returns
-    `(string)`, and both return `(nil, err)` on failure. Leave one out to
-    refuse that access. Writes wait and go out as one `write` per file right
-    before a tool call, a read of that path, or the end of the run, and a
-    cancelled run drops the ones still waiting. A failed write ends the run,
-    unless a read sent it, then it raises `OSError` just like a failed read.
+  - `files` (`table?`) callbacks that serve `open()`, `os` and `pathlib`.
+    Without it, any OS call ends the run. A missing callback refuses that
+    access, and `(nil, err)` refuses one call. Binary I/O, removing and
+    renaming always raise `RuntimeError`. `os.getenv` sees only non-secret
+    variables like `HOME`. Sleeps and metadata queries, `inspect` included,
+    share a budget of `timeout` seconds, and going over ends the run.
+    - `read(path)` returns `(content)`. A refusal raises `OSError`.
+    - `write(path, content, append)` returns `(string)` or `(true)`. Writes
+    are buffered per file, and flushed before a read of that file, before
+    any tool call or metadata query, and at the end of the run. A
+    cancelled run drops them. A failed flush ends the run, unless a read
+    triggered it, then the read raises `OSError`.
+    - `inspect(path)` gets the absolute path of each metadata query
+    (`os.stat`, `os.walk`, `Path.glob`) and returns `(true)` to allow it.
+    A walk or glob covers everything under {path}. A refusal raises
+    `RuntimeError`. Needs the `fs_read` permission.
+    - `mkdir(path, parents)` returns `(true)` once the directory exists.
+    It only gets missing paths that passed `inspect`. A refusal raises
+    `OSError`.
 
 **Returns:** (`table`, `string?`) Result table, plus an error string on failure.
 
@@ -3710,10 +3864,82 @@ end
 Key mappings, modeled after `vim.keymap`.
 
 ```lua
-maki.keymap.set("n", "<C-t>", function()
+maki.keymap.set({ "n", "i" }, "<C-t>", function()
   print("hello")
 end, { desc = "Say hello" })
 ```
+
+## Modes
+
+As in Neovim, maki is in one mode at a time, and a binding fires only
+in the modes it was set for.
+
+| Mode | When |
+| --- | --- |
+| `"i"` (insert, the default) | The chat input has the keyboard, and keys type into it. |
+| `"n"` (normal) | Set by `maki.ui.set_mode("n")`, and while a picker, modal, prompt or focused window has the keyboard or a finished subagent's chat is shown. |
+
+The mode a plugin set comes back when the chat input gets the keyboard
+again. In normal mode, keys never type or delete in the chat input.
+Moving the cursor, history, pasting and `<CR>` to send still work.
+
+Bind a shortcut in `{ "n", "i" }` to make it work everywhere, as the
+built-in plugins do. Read the mode with `maki.fn.mode()`, and watch it
+with the `"ModeChanged"` autocmd.
+
+```lua
+-- A tiny vim mode: Esc leaves insert mode, i goes back.
+maki.keymap.set("i", "<Esc>", function() maki.ui.set_mode("n") end)
+maki.keymap.set("n", "i", function() maki.ui.set_mode("i") end)
+
+-- dd deletes the cursor's line. A lone d expires after 500 ms.
+local pending
+maki.keymap.set("n", "d", function(ev)
+  if not pending then
+    pending = maki.defer_fn(function() pending = nil end, 500)
+    return
+  end
+  pending:stop()
+  pending = nil
+  local st = ev.input
+  local head = st.text:sub(1, st.cursor):match("^.*\n")
+  maki.ui.input_edit({
+    start = head and #head or 0,
+    stop = st.text:find("\n", st.cursor + 1, true) or #st.text,
+    text = "", version = st.version, session_id = st.session_id,
+  })
+end)
+```
+
+With this `<Esc>` binding, the built-in `Esc Esc` (rewind) works only
+from normal mode.
+
+Older versions fired `"n"` bindings while you typed. See
+[Upgrading old keymaps](/docs/keybindings/#upgrading-old-keymaps).
+
+## Key resolution
+
+Each key runs one handler: the first match in this list, for the
+current mode.
+
+1. `<C-c>` and `<C-z>`, which no binding can take. `<C-z>` suspends
+   here, and `<C-c>` still goes to step 2 first.
+2. Maki's modals and prompts, then the focused window, then Maki's
+   pickers. They take every key, except the plan form and the `/`
+   command list, which pass on the keys they do not use. The focused
+   window runs its buffer's bindings, then its `win:recv`.
+3. Windows on screen, front first: each one's buffer bindings, then
+   the keys it claimed with the `keys` option of `maki.ui.open_win`.
+4. `<Esc>` while the agent runs, in either mode. Maki takes it, and a
+   second one in a row cancels the turn.
+5. Global bindings, the last `set` first.
+6. Maki's built-in keys and the chat input.
+
+`ev.fallback()` jumps to step 6, or to `win:recv` for a binding on the
+focused window's buffer. `<Paste>` follows the same list.
+
+To share one key between plugins, see
+[Composing keys](/docs/keybindings/#composing-keys).
 
 ## Key notation
 
@@ -3740,6 +3966,7 @@ go in angle brackets, after any modifiers.
 | Arrows | `<Up>`, `<Down>`, `<Left>`, `<Right>` | |
 | Navigation | `<Home>`, `<End>`, `<PageUp>`, `<PageDown>`, `<Insert>` | |
 | Function keys | `<F1>` through `<F24>` | |
+| Bracketed paste | `<Paste>` | |
 
 Modifiers are `C-` (control), `M-` (alt) and `S-` (shift), in that
 order: `<C-M-x>`. `Ctrl-`, `Alt-`, `A-` and `Shift-` are accepted as
@@ -3772,41 +3999,100 @@ spellings.
 maki.keymap.set({mode}, {lhs}, {rhs}, {opts?})
 ```
 
-Bind a key to a Lua function, like `vim.keymap.set`. Only normal mode
-(`"n"`) is supported.
+Bind a key to a Lua function, like `vim.keymap.set`.
 
-Bindings are global and belong to the plugin that set them. They stack:
-the last `set` wins, and when that plugin calls `del` or unloads, the
-previous holder gets the key back. Shadowing another plugin's binding logs
-a warning naming both. Setting a key you already hold replaces your
-binding.
+The binding fires only in the [modes](/docs/lua-api/#modes) you list. A
+key bound in `"i"` no longer types, so bind keys like `<Tab>` or `<C-x>`
+there, rarely a letter. A binding on a key that types text, like `a`,
+`<Space>` or `<Paste>`, needs `session_read` in every mode, because it
+sees what the user types. A plugin may switch the mode itself, so a
+letter bound in `"n"` could hear every key the user meant to type. That
+goes for a buffer binding too, since its window can sit on screen while
+the user types into the chat input. Keys
+with `C-` or `M-`, function keys and keys like `<CR>`, `<Esc>`, `<Tab>`,
+`<BS>` or the arrows need nothing.
+[Key resolution](/docs/lua-api/#key-resolution) shows which binding gets
+a key.
 
-For a key a popup should own only while it is on screen, use the `keys`
-option of `maki.ui.open_win` instead.
+Bindings belong to the plugin that set them and stack per mode. The last
+`set` wins and logs a warning naming the plugin it shadows. When that
+plugin calls `del` or unloads, the shadowed binding comes back. Setting a
+key you already hold replaces your binding.
 
-A handler that runs consumes the key, even if it raises (the error is
-logged). If the plugin has too many callbacks in flight, the key goes to
-maki's built-in binding rather than to the binding underneath.
+A binding with `opts.buffer` comes before any global binding and goes
+away with the buffer. Use it for the keys of a popup. A handler that
+refers to the buffer keeps it alive, so `del` it when the popup closes.
 
-`<C-c>` and `<C-z>` are reserved so quit and suspend always work. Binding
-either is an error.
+The handler consumes the key, even when it throws (the error is logged).
+Call `ev.fallback()` to let maki handle the key after all. A handler that
+changes the text of the input needs `input`, `agent` and `session_write`,
+see [chat input](/docs/lua-api/#chat-input).
+
+While a handler runs, the keys, pastes and clicks after it wait, so its
+edits and mode switches are in place before the next key lands. Keys
+wait one second at most, and stop waiting when another window takes the
+keyboard, like a picker the handler opened. If a modal or a prompt opens
+meanwhile, like an alert, a permission prompt or a question, the waiting
+keys are dropped so they cannot answer it, and the status bar says so.
+
+Every key waits its turn, also `<Esc>` while the agent runs, except
+`<C-c>` and `<C-z>`. A `<C-c>` drops the pending `ev.fallback()`. If keys
+were waiting, it drops them too and the status bar says so, and only the
+next `<C-c>` works as usual. Otherwise it works as usual right away.
+
+A key never sends text that changed after it was pressed, because the
+user never saw what it would send. If the input changed or the keyboard
+moved while a `<CR>` waited, maki drops that send and asks the user to
+press Enter again. The same goes for `ev.fallback()` on `<CR>` after any
+change since the press, your handler's own edits included. To send what
+your handler wrote, use
+[`maki.ui.input_submit`](/docs/lua-api/#maki-ui-input_submit).
+
+Throws on an invalid mode or key, on `<C-c>` and `<C-z>`, which stay
+reserved for quit and suspend, on a taken key with `unique`, and with
+`permission denied` on a typing key in `"i"` without `session_read`.
 
 **Parameters:**
 
-- `{mode}` (`string`) Mode letter. Currently only `"n"` is accepted.
-- `{lhs}` (`string`) Key in Vim notation, e.g. `"<C-t>"`, `"<Space>"`, `"a"`.
-- `{rhs}` (`function`) Called when the key is pressed. The return value is ignored.
+- `{mode}` (`string|string[]`) `"n"`, `"i"`, or a list of them.
+- `{lhs}` (`string`) Key in Vim notation, e.g. `"<C-t>"`, `"a"`, or `"<Paste>"` for bracketed paste.
+- `{rhs}` (`function`) Called with an event table `ev`. The return value is ignored. `ev` has:
+  - `key` (`string`) the key, in canonical notation.
+  - `input` (`table?`) the chat input at the press, as `maki.ui.input` returns it. Pass its `version` and `session_id` to `maki.ui.input_edit`. Only with `session_read`, else nil.
+  - `text` (`string?`) `<Paste>` only: the pasted text, with `\n` line endings. maki does not insert it. It is cleaned the way `maki.ui.input_edit` cleans text, so `#ev.text` is what inserting it adds. Only with `session_read`, else nil.
+  - `fallback` (`function`) runs maki's own handling of the key, as if no plugin had bound it (see [Key resolution](/docs/lua-api/#key-resolution)). Call it once, before the handler returns.
+    - It lands after the handler's earlier `maki.ui` calls and before the waiting keys.
+    - It returns `true` once the key is queued, or `nil` and an error.
+    - The key is dropped if the keyboard, the mode, the cursor or the selection moved since the press, your handler's own changes included.
 - `{opts?}` (`table?`) Options:
-  - `desc` (`string`) short description shown in the keymap list.
-  - `unique` (`boolean`) fail the call, naming the owner, when anything
-    already maps the key. Default false.
+  - `desc` (`string`) shown next to the key in `/help`.
+  - `unique` (`boolean`) throw, naming the owner, when the key is already
+    bound in one of the modes. Default false.
+  - `buffer` (`Buf`) bind the key only while a window showing this buffer is
+    on screen.
 
 **Example:**
 
 ```lua
-maki.keymap.set("n", "<C-t>", function()
-  print("toggle!")
-end, { desc = "Toggle panel" })
+-- Tab in an empty input starts a review prompt, else it switches plan/build:
+maki.keymap.set("i", "<Tab>", function(ev)
+  local st = ev.input
+  if st.text ~= "" then
+    return ev.fallback()
+  end
+  maki.ui.input_edit({
+    start = 0, stop = 0, text = "Review the staged changes: ",
+    version = st.version, session_id = st.session_id,
+  })
+end)
+
+-- Keys of a popup, live only while it is on screen:
+local buf = maki.ui.buf()
+local win = maki.ui.open_win(buf, { focus = false, width = 20, height = 3 })
+maki.keymap.set("i", "<Esc>", function()
+  maki.keymap.del("i", "<Esc>", { buffer = buf })
+  win:close()
+end, { buffer = buf })
 ```
 
 ---
@@ -3814,26 +4100,29 @@ end, { desc = "Toggle panel" })
 ### `maki.keymap.del()` {#maki-keymap-del}
 
 ```lua
-maki.keymap.del({mode}, {lhs})
+maki.keymap.del({mode}, {lhs}, {opts?})
 ```
 
-Remove your plugin's mapping for {lhs} in {mode}, like `vim.keymap.del`.
-The key goes back to whoever held it before you, or to maki's default
-binding.
+Remove your plugin's binding for {lhs} in {mode}, like `vim.keymap.del`.
+The key goes back to the binding yours shadowed, or to maki's default.
 
-A plugin can only remove its own mappings. If another plugin maps {lhs},
-nothing changes and a warning names that plugin. Does nothing if nothing
-maps {lhs}.
+Only your own bindings go. If another plugin holds {lhs}, nothing
+changes and a warning names it. Only the modes you list are removed: a
+binding set in `{ "n", "i" }` and removed in `"n"` stays in `"i"`.
+Throws on an invalid mode or key.
 
 **Parameters:**
 
-- `{mode}` (`string`) Mode letter (reserved for future modes).
+- `{mode}` (`string|string[]`) `"n"`, `"i"`, or a list of them.
 - `{lhs}` (`string`) Key to unmap, in Vim notation.
+- `{opts?}` (`table?`) Options:
+  - `buffer` (`Buf`) remove the binding set for this buffer instead of the
+    global one.
 
 **Example:**
 
 ```lua
-maki.keymap.del("n", "<C-t>")
+maki.keymap.del({ "n", "i" }, "<C-t>")
 ```
 
 ---
@@ -4054,7 +4343,7 @@ Requires the `session_settings` [plugin permission](#plugin-permissions).
 ```lua
 maki.model.set("anthropic/claude-opus-4-6")
 maki.model.set({ spec = "zai/glm-5", thinking = "high" })
-maki.keymap.set("n", "<M-t>", function() maki.model.set({ thinking = "" }) end)
+maki.keymap.set({ "n", "i" }, "<M-t>", function() maki.model.set({ thinking = "" }) end)
 ```
 
 ---
@@ -4066,9 +4355,10 @@ maki.model.tier({name}, {provider?})
 ```
 
 The model maki uses for a tier, the same one a subagent asking for that
-tier gets: your pick from the `/model` picker, else the curated default.
-`assigned` tells the two apart. Pass `provider` to prefer its models, the
-way subagents prefer the session's provider.
+tier gets: user's pick from the `/model` picker for that tier (whatever
+provider it names), else the curated default within `provider`, else any
+provider. `assigned` tells a pick apart from a default. Pass `provider` to
+prefer its models, the way subagents prefer the session's provider.
 
 **Parameters:**
 
@@ -4993,7 +5283,10 @@ Requires the `session_write` [plugin permission](#plugin-permissions).
 **Parameters:**
 
 - `{opts?}` (`table?`) Optional fields:
-  - `messages` (`table`) what `export` or `messages` return.
+  - `messages` (`table`) what `export` or `messages` return. A user turn
+    that starts with `/` or `!`, or is `exit`, needs the `agent`
+    permission too, since a rewind puts it back in the input for Enter
+    to run.
   - `facts` (`table`) what `export` returns: the date, working directory,
     model, instructions and hints the model was last told.
   - `model` (`string`) model spec. Defaults to the focused tab's in the TUI,
@@ -6561,10 +6854,168 @@ local win = maki.ui.open_win(buf, { title = "Greeting", width = "50%", height = 
 Without a UI (`maki -p`, the sdk, ACP), buffers and the text helpers
 still work. The calls that need a screen behave like this:
 
-- `action`, `input`, and `input_edit` return `nil, "no interactive UI attached"`.
+- `input`, `input_edit`, `input_decorate`, `input_submit`, and `action`
+  on a built-in name return `nil, "no interactive UI attached"`.
+  Plugin actions still run.
 - `open_editor` returns -1.
 - `flash` writes to the log.
-- `open_win`, `set_status_hint`, and `set_window_title` have no effect.
+- `open_win`, `set_status_hint`, `set_window_title`, `set_mode` and `input_rules` have no effect.
+  `input_rules` still throws on a bad rule, so a plugin's tests catch it.
+
+### Chat input
+
+Plugins can read, style, change and send the chat input:
+
+| Job | Call |
+| --- | --- |
+| Read the text, the cursor and the selection | [`input`](#maki-ui-input) |
+| Style text by what it says, like a `$skill:go` chip | [`input_rules`](#maki-ui-input_rules) |
+| Style text from plugin state, like ghost text or diagnostics | [`input_decorate`](#maki-ui-input_decorate) |
+| Change the text, the cursor or the selection | [`input_edit`](#maki-ui-input_edit) |
+| Send the input, as Enter does | [`input_submit`](#maki-ui-input_submit) |
+| React when the input changes | the `InputChanged` [event](#maki-api-create_autocmd) |
+| Switch to normal mode for a vim mode | [`set_mode`](#maki-ui-set_mode), see [Modes](/docs/lua-api/#modes) |
+
+A key that types `TODO: ` at the cursor:
+
+```lua
+maki.keymap.set("i", "<M-t>", function(ev)
+  local st = ev.input
+  maki.ui.input_edit({
+    start = st.cursor, stop = st.cursor, text = "TODO: ",
+    version = st.version, session_id = st.session_id,
+  })
+end)
+```
+
+When the look follows from the text, prefer `input_rules`. A rule runs
+no Lua per keystroke, and its marks are right again after undo, redo,
+a history recall or a chat switch.
+
+The calls other than `input_rules` wait for the UI to answer. They work
+from any callback, like a key handler or an autocmd. While your plugin
+loads, they return `nil` and an error.
+
+Moving the cursor or the selection needs the `input`
+[permission](#plugin-permissions), because your next key lands at the
+cursor. Changing the text needs `agent` and `session_write` as well,
+what sending a message needs, because your next Enter sends it. This
+covers `input_edit` and the built-in [actions](#maki-ui-action) that
+edit, like `undo` or a history recall. `input_edit` needs
+`session_read` too. Without them they raise `permission denied`.
+
+Reading the input needs `session_read`. This covers `maki.ui.input`,
+`ev.input` and `ev.text` in a key handler, and a binding on a key that
+types text, see
+[`maki.keymap.set`](#maki-keymap-set). Styling the input needs no
+permission.
+
+A plugin that may change the text may write any text. Before Enter
+runs or sends it, it checks each plugin that wrote it:
+
+| Text starts with | Each plugin that wrote it needs |
+| --- | --- |
+| `!` | `run` |
+| a `/` command | what that command needs from a plugin, see [`maki.api.run_command`](#maki-api-run_command). Only the user can run some commands, like `/yolo` |
+| anything else | `agent` and `session_write`, like [`input_submit`](#maki-ui-input_submit) |
+
+If one of them falls short, Enter leaves the text where it is and the
+status bar names that plugin. The text becomes the user's again once
+it is sent or cleared, once another text replaces it, like a history
+recall, or once the user replaces all of it, like selecting everything
+and typing.
+
+A draft a plugin wrote, restored after a restart, counts as written by
+an unnamed plugin that holds `agent` and `session_write` at most,
+which the status bar calls `a plugin`. So does a rewound or forked
+turn that starts with `/` or `!`, or is `exit`.
+
+Upgrading: `input_edit` needs `input` and `session_read` now, plus
+`agent` and `session_write` to change the text, and the editing
+built-in actions need `input`, `agent` and `session_write`. A binding
+on a key that types text, like `a` or `<Paste>`, needs `session_read`
+in any mode. A `plugin.toml` you wrote yourself grants them unless it
+sets them to `false`. A package needs its author to add them, and you to approve
+the package again.
+
+### Offsets and versions
+
+Offsets count bytes from 0, and a range leaves out `stop`. So the
+range `start, stop` is `text:sub(start + 1, stop)`, and
+`text:sub(1, cursor)` is everything before the cursor. A newline is
+one byte.
+
+A tab is one open session, named by its `session_id`. Its chats, the
+main agent's and each subagent's, share one chat input, and each chat
+keeps its own draft.
+
+The calls work on the input of the focused tab. `input`, the
+`InputChanged` event and `ev.input` of a key handler report its
+`version` and `session_id`. Pass both to `input_edit`,
+`input_decorate` and `input_submit`. Each tab counts versions from
+zero, so a version alone cannot tell two tabs apart.
+
+The user may type between your read and your call. `input_edit` and
+`input_decorate` then move your offsets past what was typed, and
+`input_submit` fails. All three fail when:
+
+- `session_id` names a tab that is not focused.
+- The text was replaced since: a history recall, a chat switch that
+  swapped in another draft, a change made in `$EDITOR`, or a send.
+- So much changed since `version` that the offsets can no longer be
+  moved.
+
+`input_edit` and `input_submit` also fail while the chat input is
+hidden, since the user could not read what gets sent. It is hidden
+while a permission prompt, the plan form or a `below` split takes its
+place, or while a picker, a modal or a focused plugin window covers
+it. `input_decorate` still works then.
+
+A failed call returns `nil` and an error message. Read the input again
+and retry. Bad arguments, like a missing or an unknown field, throw.
+
+### Input marks
+
+A mark styles a byte range of the input. `input_rules` puts one on
+every match, and `input_decorate` and `input_edit` push marks at the
+offsets you give. Marks and rules live in namespaces, named by `ns`.
+Each plugin has its own namespaces, so two plugins can use the same
+name. A mark has these fields:
+
+| Field | Type | Effect |
+| --- | --- | --- |
+| `start`, `stop` | integer | The range, for pushed marks only. Without `stop` the mark is a point, which only `virt_text` shows. |
+| `hl` | string or table | A theme style name like `"accent"`, or `{ fg, bg, bold, italic, underline, dim, strikethrough, reversed }`. |
+| `conceal` | string | Text drawn in place of the range. `""` hides it. |
+| `reveal` | string | `"cursor"` shows the raw text while the cursor is inside the range or on its edge. |
+| `atomic` | boolean | The cursor steps over the range, a selection takes it whole, and a delete that cuts into it removes all of it. |
+| `virt_text` | table | Spans drawn but never part of the text, `{ { text, hl? }, ... }`. |
+| `virt_text_pos` | string | `"eol"` (default) draws `virt_text` after the line, `"inline"` before `start`. |
+| `lang` | string | Highlights the range as code in this language. |
+
+The text of `conceal` and `virt_text` must not hold control
+characters, newlines included. A mark never edits the text, so a send
+carries the raw text, concealed ranges included.
+
+Where marks overlap:
+
+- A pushed mark draws over every rule, and a mark pushed later over
+  one pushed earlier.
+- A rule whose `ns` was first set later draws over one set earlier.
+  Replacing a rule keeps its place.
+- Within a tree-sitter rule, a later pattern draws over an earlier
+  one, and `markdown_inline` over `markdown`.
+- Within one pattern, a capture whose name first appears later in the
+  query draws over one that appears earlier. In
+  `(inline_link (link_text) @text) @link`, `@link` draws over `@text`.
+
+Pushed marks move with the text: a range keeps covering the same
+words, and a point stays after text typed at it. A range is dropped
+once its text is gone, or when an edit lands inside it while it
+conceals or is atomic. Undo brings back the text without its marks, so
+undoing the delete of a chip shows its raw text. Marks stay with their
+draft across chat switches, go away when the plugin unloads, and are
+not saved.
 
 ---
 
@@ -6579,7 +7030,8 @@ created in a task becomes the "live" buffer, streamed to the UI while
 the tool runs, which is what the tool's own output pane wants. A
 float that opens during a tool call would take that spot away, so
 create its buffer with `{ scratch = true }`. It matches nvim's
-`nvim_create_buf(false, true)`.
+`nvim_create_buf(false, true)`. A buffer belongs to the task that
+made it, so this throws at a plugin's top level.
 
 **Parameters:**
 
@@ -6683,7 +7135,7 @@ every case.
 - `{lang}` (`string`) Language identifier, e.g. "rust", "python".
 - `{opts?}` (`table?`) Options. Fields:
   - `independent` (`boolean`) highlight each line without cross-line context. Default false.
-  - `prefix` (`string`) prepend to the source before highlighting (affects token context). Default "".
+  - `prefix` (`string`) preceding source used as token context. Only the nearest lines fitting within 16 KiB are parsed, so earlier comments or strings may affect coloring. Default "".
 
 **Returns:** (`table`) Lines: `{ { {text, style}, ... }, ... }`. Each style is `{fg, bold?, italic?, underline?}`.
 
@@ -6819,6 +7271,35 @@ local t = maki.ui.truncate_text("hello world", 5)
 
 ---
 
+### `maki.ui.set_mode()` {#maki-ui-set_mode}
+
+```lua
+maki.ui.set_mode({mode})
+```
+
+Switches the chat input to normal mode (`"n"`) or insert mode (`"i"`),
+like leaving and entering insert mode in Neovim.
+
+The mode is global and stays until a plugin switches it again, apart from
+the times [Modes](/docs/lua-api/#modes) lists. It applies at once:
+`maki.fn.mode()` returns it and the next key is matched against it. If
+your plugin unloads while the input is in normal mode, maki switches it
+back to insert mode.
+
+Throws on any mode but `"n"` and `"i"`.
+
+**Parameters:**
+
+- `{mode}` (`string`) `"n"` or `"i"`.
+
+**Example:**
+
+```lua
+maki.keymap.set("n", "i", function() maki.ui.set_mode("i") end)
+```
+
+---
+
 ### `maki.ui.flash()` {#maki-ui-flash}
 
 ```lua
@@ -6846,39 +7327,74 @@ maki.ui.flash("Copied to clipboard!")
 maki.ui.action({name})
 ```
 
-Runs a built-in UI action by name, exactly as its default keybinding
-would. Handy when a default key never reaches maki because tmux or
-your terminal grabs it first: bind a new key with `maki.keymap.set`
-and call this from it.
+Runs a built-in or plugin action by name, and returns whether it handled
+the request.
 
-Valid names: `"file_picker"`, `"search"`, `"help"`,
-`"plan_toggle"`, `"plan_editor"`, `"edit_input"`, `"pop_queue"`,
-`"prev_chat"`, `"next_chat"`, `"model_picker"`.
+A built-in does what its default key does, so you can move it to another
+key:
 
-Most actions are free, since they open something the user then sees and
-drives. `"pop_queue"` needs `session_write`, because it throws away a
-queued prompt. Without it the call raises the usual `permission denied`
-error.
+| Built-in | What it does | `false` when |
+| --- | --- | --- |
+| `"file_picker"` | Opens the file picker | |
+| `"search"` | Opens message search | |
+| `"help"` | Opens or closes `/help` | |
+| `"model_picker"` | Opens the model picker | |
+| `"plan_toggle"` | Opens or closes the plan form | no plan is ready |
+| `"plan_editor"` | Opens the plan in your editor | there is no plan |
+| `"edit_input"` | Opens the chat input in your editor | |
+| `"pop_queue"` | Removes the first queued message | |
+| `"prev_chat"`, `"next_chat"` | Shows the previous or next chat, with its own draft | |
+| `"input_raw"` | Switches the input between drawing what plugins conceal and showing the text under it, which is what gets sent | |
+| `"undo"`, `"redo"` | Undoes or redoes one input edit | nothing to undo or redo |
+| `"history_prev"`, `"history_next"` | Recalls the previous or next prompt | at either end of the history |
+| `"newline"` | Inserts a new line | |
 
-There is no action for sending the user's message. To take keys like
-`<CR>` while a popup is open, use the `keys` option of `maki.ui.open_win`.
+`"undo"`, `"redo"`, `"history_prev"`, `"history_next"` and `"newline"`
+edit the chat input, also in normal mode. They need the `input`, `agent`
+and `session_write` permissions, see [chat input](#chat-input), and throw
+without them like any gated call. They return `false` in a finished subagent's chat, which has
+no input. `"pop_queue"` needs `session_write`, because it throws away a
+queued prompt. The other built-ins need no permission.
 
-For slash commands rather than keybound actions, see
-`maki.api.run_command`.
+A built-in runs in the UI after your earlier `maki.ui` calls, and
+`action` waits for its answer. While your plugin loads, it returns `nil`
+and an error at once.
+
+A plugin action has a dot in its name, like `"completion.accept"`. It
+comes from [`maki.api.register_action`](#maki-api-register_action), which
+also says what permissions a caller needs. It runs at once, also while
+your plugin loads, and `action` returns what it returned.
+
+`action` returns `nil` and an error, which an `if` treats as not handled,
+when:
+
+- The action's plugin is not loaded.
+- The action threw.
+- Your plugin lacks a permission a plugin action needs. The status bar
+  shows this too.
+- A built-in runs without a UI.
+
+It throws on a name that cannot be right: no dot and not a built-in, or
+one its loaded plugin never registered.
+
+To try several actions on one key, see
+[Composing keys](/docs/keybindings/#composing-keys). To send the input,
+use `maki.ui.input_submit`. For slash commands, see `maki.api.run_command`.
 
 **Parameters:**
 
-- `{name}` (`string`) Action name, e.g. `"file_picker"`.
+- `{name}` (`string`) Action name, e.g. `"file_picker"` or `"completion.accept"`.
 
-**Returns:** (`boolean|nil`, `string|nil`) `true` on success, or nil and an error for an unknown name or a missing UI.
+**Returns:** (`boolean|nil`, `string|nil`) Whether the action handled it, or nil and an error.
 
 **Example:**
 
 ```lua
--- Open the built-in file picker with Ctrl+Q instead of Ctrl+S:
-maki.keymap.set("n", "<C-q>", function()
-  maki.ui.action("file_picker")
-end)
+-- A vim plugin's undo in normal mode, which needs `input`, `agent` and `session_write`:
+maki.keymap.set("n", "u", function() maki.ui.action("undo") end)
+
+-- A key for a built-in that has none:
+maki.keymap.set({ "n", "i" }, "<M-r>", function() maki.ui.action("input_raw") end)
 ```
 
 ---
@@ -6920,6 +7436,10 @@ Opens a floating or split window that displays the contents of {buf}.
 Returns a Win handle you can use to receive events, update layout,
 and close the window when you are done.
 
+A window belongs to one session and shows only while that session's tab is
+focused. It closes when the session leaves its tab (`/new`, loading another
+session, closing the tab), or right away if the session is not in any tab.
+
 **Parameters:**
 
 - `{buf}` ([`Buf`](#maki-ui-Buf)) Buffer to display.
@@ -6928,7 +7448,7 @@ and close the window when you are done.
   - `height` (`integer|string`) window height. Integer for absolute rows; "N%" for percent of terminal height. Default "70%".
   - `row` (`integer?`) row offset from the anchor corner. Negative values move up.
   - `col` (`integer?`) column offset from the anchor corner.
-  - `anchor` (`string`) corner the (row, col) offset is relative to. One of "NW" (default), "NE", "SW", "SE". Or "input_caret", which sits the window beside the chat input caret: the host takes the roomier side of the caret, trims the height to what fits there, keeps the whole width on screen, and re-places it every frame, so it follows wraps, resizes and any modal taking focus. `row` and `col` shift the window off that spot, and `stack` grows the next one away from the caret. With no caret on screen, because a form, a permission prompt or a `below` split has taken the input box, it falls back to the centred default, `row` and `col` still applying.
+  - `anchor` (`string`) corner the (row, col) offset is relative to. One of "NW" (default), "NE", "SW", "SE". Or "input_caret", which sits the window beside the chat input cursor: the host takes the roomier side of the cursor, trims the height to what fits there, keeps the whole width on screen, and re-places it on every redraw, so it follows wraps, resizes and any modal taking focus. `row` and `col` shift the window off that spot, and `stack` grows the next one away from the cursor. With no cursor on screen, because a form, a permission prompt or a `below` split has taken the input box, it falls back to the centred default, `row` and `col` still applying.
   - `border` (`string`) border style. One of "rounded" (default), "single", "double", "none".
   - `title` (`string`) text shown in the top border. Default "".
   - `title_pos` (`string`) title alignment. One of "left" (default), "center", "right".
@@ -6940,10 +7460,11 @@ and close the window when you are done.
   - `split` (`string`) dock the window to an edge instead of floating. One of "above", "below", "left", "right", "panel", or "" (floating, default).
   - `order` (`integer`) paint order among split windows at the same edge. Default 50.
   - `focus` (`boolean`) whether the window takes keyboard focus on open. Default true.
-  - `keys` (`table`) keys this window takes while it is on screen, in `maki.keymap` notation, e.g. `{ "<Tab>", "<CR>" }`. Requires `focus = false`, since a focused window already gets every key. A claimed key goes to this window's `recv` and never reaches the chat input or `maki.keymap.set` bindings. Claims are released automatically when the window closes, and a hidden or zero-size window claims nothing. Host pickers and the slash command palette take keys first while open over the window. `<C-c>` and `<C-z>` are refused.
+  - `keys` (`table`) keys this window takes while it is on screen, in `maki.keymap` notation, e.g. `{ "<Tab>", "<CR>" }`. `maki.keymap.set` with `{ buffer = buf }` is the newer way to give a popup keys, with a handler per key, a mode, and `ev.fallback()`. Requires `focus = false`, since a focused window already gets every key. A claimed key goes to this window's `recv` and never reaches the chat input or global `maki.keymap.set` bindings. The window's buffer bindings are asked first. Claims are released automatically when the window closes, and a hidden or zero-size window claims nothing. Host pickers and the slash command palette take keys first while open over the window. `<C-c>` and `<C-z>` are refused.
   - `visible` (`boolean`) whether the window is initially visible. Default true. See `win:hide()` for what hiding does.
   - `needs_input` (`boolean`) whether the window means the session needs user input. Default false.
   - `stack` (`boolean`) offset the window past the other stacked windows sharing its anchor, in open order, with a one row gap. Closing one moves the rest up. Floating windows only. Default false.
+  - `session` (`string`) id of the session that owns the window, e.g. `ev.data.session_id` or `ctx:session_id()`. Default: the session of the running tool call, else the focused tab's. A `maki.async.run` task keeps the tool call's session, a `maki.async.spawn` task does not.
 
 **Returns:** ([`Win`](#maki-ui-Win)) Window handle.
 
@@ -6966,14 +7487,15 @@ local win = maki.ui.open_win(buf, {
 ### `maki.ui.set_status_hint()` {#maki-ui-set_status_hint}
 
 ```lua
-maki.ui.set_status_hint({spans})
+maki.ui.set_status_hint({spans}, {opts?})
 ```
 
-Shows key hints in the status bar for your plugin. Each hint is a {key, label} pair. Pass nil to clear your plugin's hints. Only your own hints are affected, other plugins keep theirs.
+Shows your plugin's key hints in the status bar. Other plugins' hints are not affected. By default the hints show in every tab, even when set from a tool call. With `opts.session` they show only in that session's tab, replacing your every-tab hints there, and are cleared when the session leaves the tab.
 
 **Parameters:**
 
-- `{spans}` (`table|nil`) Sequence of {key, label} pairs, e.g. `{{"q", "quit"}, {"j", "down"}}`. Pass nil to remove the plugin's hints.
+- `{spans}` (`table|nil`) Sequence of {key, label} pairs, e.g. `{{"q", "quit"}, {"j", "down"}}`. nil clears your hints for `opts.session`, or all your hints if `opts.session` is not set.
+- `{opts}` (`table?`) `session` (string): id of the session whose tab shows the hints, e.g. `ev.data.session_id` or `ctx:session_id()`. Default: every tab.
 
 **Example:**
 
@@ -6981,6 +7503,18 @@ Shows key hints in the status bar for your plugin. Each hint is a {key, label} p
 maki.ui.set_status_hint({ {"q", "quit"}, {"j", "down"} })
 -- later, clear them:
 maki.ui.set_status_hint(nil)
+
+-- Only in the tab of the session that is running a turn:
+maki.api.create_autocmd("TurnStart", {
+  callback = function(ev)
+    maki.ui.set_status_hint({ {"Esc", "cancel"} }, { session = ev.data.session_id })
+  end,
+})
+maki.api.create_autocmd("TurnEnd", {
+  callback = function(ev)
+    maki.ui.set_status_hint(nil, { session = ev.data.session_id })
+  end,
+})
 ```
 
 ---
@@ -7019,38 +7553,151 @@ maki.ui.set_window_title("")
 maki.ui.input()
 ```
 
-Reads the chat input text and the cursor position.
-
-Offsets are byte offsets into `text`, the unit the Lua string library
-indexes by, so `text:sub(1, cursor)` is everything before the cursor. A
-newline counts as one byte.
+Reads the chat input of the focused tab.
 
 The returned table has:
 
-- `session_id` (string) the tab the value was read from. Pass it to
-  `input_edit`, which refuses once another tab is focused.
 - `text` (string) the whole value, newlines included.
-- `cursor` (integer) byte offset of the cursor into `text`.
-- `version` (integer) counter of changes to the value. Pass it to
-  `input_edit`, which refuses once the value has moved on.
+- `cursor` (integer) byte offset of the cursor.
+- `anchor` (integer|nil) byte offset of the other end of the selection,
+  nil when nothing is selected. The selected bytes run from
+  `math.min(anchor, cursor)` to `math.max(anchor, cursor)`.
+- `version` (integer) and `session_id` (string), for the calls that
+  write. See [offsets and versions](#offsets-and-versions).
 
-The cursor line and column are a slice of those two, so the table leaves
-them out: with `local before = st.text:sub(1, st.cursor)`,
-`select(2, before:gsub("\n", ""))` is the 0-based line and
-`#before:match("[^\n]*$")` the byte column inside it.
-
-To put a window on the caret, open it with `anchor = "input_caret"`. The
-host re-places it every frame, so it follows wraps and resizes.
+The table has no line or column. The example works them out. To open a
+window at the cursor, pass `anchor = "input_caret"` to
+[`open_win`](#maki-ui-open_win), an option unrelated to the selection
+`anchor` here.
 
 Requires the `session_read` [plugin permission](#plugin-permissions).
 
-**Returns:** (`table|nil`, `string|nil`) The input state, or nil and an error.
+**Returns:** (`table|nil`, `string|nil`) The input state, or nil and an error without a UI.
 
 **Example:**
 
 ```lua
 local st = maki.ui.input()
 local before = st.text:sub(1, st.cursor)
+local line = select(2, before:gsub("\n", "")) -- 0-based
+local col = #before:match("[^\n]*$") -- in bytes
+```
+
+---
+
+### `maki.ui.input_rules()` {#maki-ui-input_rules}
+
+```lua
+maki.ui.input_rules({opts})
+```
+
+Sets a rule that marks the chat input in every tab, from a regex or a
+tree-sitter query. See [chat input](#chat-input) for when to use one.
+
+Each `ns` of your plugin holds one rule. Calling again with the same
+`ns` replaces it, and a call with only `ns` removes it. Rules go away
+when the plugin unloads. A bad pattern, query or mark throws. Where
+marks overlap, [input marks](#input-marks) says which draws on top.
+
+A regex rule marks every match of `pattern` with `mark`. The pattern
+uses [Rust regex syntax](https://docs.rs/regex/latest/regex/#syntax).
+Matching runs one line at a time, so a match never spans lines. The
+pattern still sees the text before its line: `\A` is the start of the
+input, `$` the end of the line and `(?m)^` the start of one. An empty
+match marks a point. In `conceal` and the text of `virt_text`, `$1` is
+capture group 1, `$0` the whole match and `$$` a plain `$`.
+
+A tree-sitter rule parses the input as `lang` and runs `query` on it, as
+the `treesitter` fields below describe. Parsing runs in the background,
+and until it catches up with typing, its marks move with the text like
+pushed marks.
+
+**Parameters:**
+
+- `{opts}` (`table`) Options:
+  - `ns` (`string`) the namespace.
+  - `pattern` (`string|nil`) the regex to match.
+  - `mark` (`table|nil`) the [mark](#input-marks) each match gets, without `start` and `stop`. Required with `pattern`.
+  - `treesitter` (`table|nil`) a tree-sitter rule, in place of `pattern` and `mark`.
+  - `treesitter.lang` (`string`) the language the input is parsed as, like `"markdown"`.
+  - `treesitter.query` (`string|table`) the query for `lang`, or a table of language = query that gives each language in the input its own. The predicates are those of `maki.treesitter.query`, and `#set!` only takes `injection.language`.
+    - Code captured as `@injection.content` is in the language `@injection.language` caught, or the one `#set! injection.language` names. When the rule has a query for that language, the code is parsed again and that query runs there. Otherwise the code gets a `lang` mark.
+    - A `markdown` rule runs its `markdown_inline` query inside blocks by itself.
+  - `treesitter.captures` (`table|nil`) capture name = template, with the fields of `mark`. Templates are drawn as written, `$` included.
+    - Each capture needs a template, and each template a capture.
+    - `@injection.content` may go without one. `@injection.language` and names starting with `_` take none, since they only name the injected language or feed predicates.
+
+**Example:**
+
+```lua
+-- Draw `$skill:go` as a ` go ` chip the cursor steps over:
+maki.ui.input_rules({
+  ns = "skill",
+  pattern = [[\$skill:([\w-]+)]],
+  mark = { conceal = " $1 ", hl = "accent", atomic = true },
+})
+-- And remove it again:
+maki.ui.input_rules({ ns = "skill" })
+-- Bold text without its stars, unless the cursor is on it:
+maki.ui.input_rules({
+  ns = "md",
+  treesitter = {
+    lang = "markdown",
+    query = { markdown_inline = [[ (strong_emphasis (emphasis_delimiter) @hidden) @strong ]] },
+    captures = {
+      hidden = { conceal = "", reveal = "cursor" },
+      strong = { hl = { bold = true } },
+    },
+  },
+})
+```
+
+---
+
+### `maki.ui.input_decorate()` {#maki-ui-input_decorate}
+
+```lua
+maki.ui.input_decorate({opts})
+```
+
+Replaces all the marks your plugin has in namespace `ns` of the chat
+input. Use it for looks that come from plugin state. When the look follows
+from the text, a [rule](#maki-ui-input_rules) fits better.
+
+Keep a look that tracks something live, like ghost text at the cursor, in
+one namespace and replace it on `InputChanged`. Marks placed once, like
+the chip over a paste, each need a namespace of their own.
+
+A mark that the typing since `version` would have
+[dropped](#input-marks) is skipped, so typing alone never fails the call.
+
+Besides the cases in [offsets and versions](#offsets-and-versions), the
+call fails when a mark ends past the end of the text, an offset falls
+inside a multi-byte character, or `start` is past `stop`.
+
+**Parameters:**
+
+- `{opts}` (`table`) Options:
+  - `ns` (`string`) the namespace to replace.
+  - `marks` (`table`) list of [marks](#input-marks), `{}` to clear the namespace.
+  - `version` (`integer`) the version the offsets were planned against.
+  - `session_id` (`string`) the tab the offsets were read from.
+
+**Returns:** (`table|nil`, `string|nil`) `{ version }`, the version the marks were placed on, or nil and an error.
+
+**Example:**
+
+```lua
+maki.api.create_autocmd("InputChanged", {
+  callback = function(ev)
+    maki.ui.input_decorate({
+      ns = "ghost",
+      marks = { { start = ev.data.cursor, virt_text = { { "complete this", "dim" } }, virt_text_pos = "inline" } },
+      version = ev.data.version,
+      session_id = ev.data.session_id,
+    })
+  end,
+})
 ```
 
 ---
@@ -7061,60 +7708,161 @@ local before = st.text:sub(1, st.cursor)
 maki.ui.input_edit({opts})
 ```
 
-Replaces a byte range of the chat input, as if the user had selected it
-and typed {text}. The cursor lands after the inserted text unless you
-say otherwise.
+Replaces byte ranges of the chat input, as if the user had selected each
+one and typed its `text`. All edits land as one change, with one new
+version and one undo step.
 
-A handler runs after the key that woke it, so the user may have typed on
-or switched tab in between. Five checks refuse the edit:
+Plan every range against the text at `version`, without counting the
+other edits in the list. Ranges must not overlap, and no two may start
+at the same offset. With `edits = {}` the call only moves the cursor or
+the selection, or replaces the marks in `ns`, so it needs `cursor`,
+`anchor` or `marks`. It makes no new version and no undo step.
 
-- `stop` past the end of the value.
-- An offset inside a multi-byte character.
-- `version` no longer current.
-- `session_id` naming a tab that is not focused. Both guards are
-  required and neither substitutes for the other: every tab counts
-  versions from zero.
-- A chat input the user cannot see, since text written there would be
-  sent later without ever being read. A permission prompt, the plan form,
-  a pack review, a `below` split, a finished subagent's chat and a
-  terminal too short to give the box a text row all take it off screen,
-  and a picker, a modal or a focused plugin window covers it.
+Besides the cases in [offsets and versions](#offsets-and-versions), an
+edit fails when:
 
-Read again and retry on any of them.
+- The user typed at or next to one of its ranges since `version`. Two
+  inserts at the same offset count, because no order is right for both.
+- `cursor` or `anchor` lands inside text changed since `version`.
+- `strict` is set and `version` is not current.
+- A range ends past the end of the text, or an offset falls inside a
+  multi-byte character.
 
-Tabs and carriage returns in {text} become spaces and newlines, and the
-other control characters are dropped, the way a paste is rewritten.
+Enter checks the text you write before it runs it, see
+[chat input](#chat-input). For marks alone, use `input_decorate`, which
+needs no permission.
 
-It costs what `maki.ui.input` costs. A plugin keymap sees keys before
-the input does, so with this call alone a plugin could note every key and
-type it back unseen.
+`text` is cleaned the way a paste is: tabs become spaces, carriage
+returns become newlines, and other control characters are dropped. With
+`cursor`, `anchor` or `marks` given, text that needs cleaning fails
+instead, since their offsets would no longer match. `ev.text` of
+`<Paste>` is already clean.
 
-Requires the `session_read` [plugin permission](#plugin-permissions).
+It also needs `session_read`, like `maki.ui.input`. Its answer and its
+errors tell where the user typed since `version`, so a plugin could
+learn the input from them.
+
+Requires the `input` and `session_read` [plugin permissions](#plugin-permissions).
 
 **Parameters:**
 
 - `{opts}` (`table`) Options:
-  - `start` (`integer`) byte offset the replaced range starts at.
-  - `stop` (`integer`) byte offset it ends at. `start == stop` inserts.
-  - `text` (`string`) what to put there, `""` to delete the range. Required, so a misspelled key cannot empty it by accident.
-  - `version` (`integer`) the version `maki.ui.input` returned, which the offsets were planned against.
-  - `session_id` (`string`) the session `maki.ui.input` read the offsets from.
-  - `cursor` (`integer|nil`) byte offset to leave the cursor at, default is the end of the inserted text.
+  - `edits` (`table|nil`) list of `{ start, stop, text }` tables, `{}` for none. Without it, `start`, `stop` and `text` are read from {opts} as one edit.
+  - `start` (`integer`) byte offset where the range starts.
+  - `stop` (`integer`) byte offset where it ends. Equal to `start` to insert.
+  - `text` (`string`) the new text, `""` to delete the range. Required.
+  - `version` (`integer`) the version the offsets were planned against.
+  - `session_id` (`string`) the tab the offsets were read from.
+  - `cursor` (`integer|nil`) byte offset to leave the cursor at, counted in the text the edits produce, as if nobody else had typed. Default is the end of the new text of the edit with the highest `start`, or the cursor as it is when `edits` is empty.
+  - `anchor` (`integer|nil`) byte offset to select from, up to `cursor`, counted like `cursor`. Without it nothing stays selected.
+  - `strict` (`boolean|nil`) accept only the current version, instead of moving the edits past newer typing. Default false.
+  - `marks` (`table|nil`) [marks](#input-marks) to replace namespace `ns` with, counted like `cursor`. They appear together with the text. A mark that does not fit fails the whole edit.
+  - `ns` (`string|nil`) the namespace for `marks`. Required with `marks`.
 
-**Returns:** (`boolean|nil`, `string|nil`) `true` on success, or nil and an error.
+**Returns:** (`table|nil`, `string|nil`) `{ version, cursor }` after the edit, or nil and an error. Pass this `version` to a call that follows.
 
 **Example:**
 
 ```lua
+-- Insert each paste under a chip, in a namespace of its own.
+local pastes = 0
+maki.keymap.set("i", "<Paste>", function(ev)
+  local st = ev.input
+  pastes = pastes + 1
+  local done = maki.ui.input_edit({
+    start = st.cursor, stop = st.cursor, text = ev.text,
+    ns = "paste" .. pastes,
+    marks = { { start = st.cursor, stop = st.cursor + #ev.text, conceal = "[pasted text]", atomic = true } },
+    version = st.version, session_id = st.session_id,
+  })
+  if not done then ev.fallback() end
+end)
+
+-- Wrap the selection in bold and keep the same words selected:
 local st = maki.ui.input()
--- Replace the "@src/ma" before the cursor with a full path:
+if not st.anchor then return end
+local s, e = math.min(st.anchor, st.cursor), math.max(st.anchor, st.cursor)
 maki.ui.input_edit({
-  start = 8,
-  stop = st.cursor,
-  text = "src/main.rs",
+  edits = {
+    { start = s, stop = s, text = "**" },
+    { start = e, stop = e, text = "**" },
+  },
+  cursor = e + 2,
+  anchor = s + 2,
   version = st.version,
   session_id = st.session_id,
 })
+```
+
+---
+
+### `maki.ui.input_submit()` {#maki-ui-input_submit}
+
+```lua
+maki.ui.input_submit({opts})
+```
+
+Sends the chat input the way Enter does, `/` commands, `!` lines, images,
+the queue and the history included. Only a `\` before the cursor differs:
+Enter turns it into a new line, and `input_submit` sends it as it is.
+
+Use it to send what a key handler wrote, since `ev.fallback()` on `<CR>`
+refuses text that changed after the press, see
+[`maki.keymap.set`](/docs/lua-api/#maki-keymap-set).
+
+It sends only while the input still holds `version`, so what goes out is
+the text your plugin planned against. After your own edit, pass the
+version `input_edit` returned. In a key handler, `ev.input.version` is
+the version at the press. Any other change makes the version stale, like
+an edit of another plugin or a key that landed after the one second keys
+wait for a handler.
+
+A send needs the [plugin permissions](/docs/lua-api/#plugin-permissions)
+that doing the same thing directly needs:
+
+- A message needs `agent` and `session_write`, like
+  `maki.session.prompt`, also when it waits in the queue or is the retry
+  Enter sends after a login.
+- A `!` or `!!` line needs `run`.
+- A `/` command needs what `maki.api.run_command` needs for it, so
+  `/yolo`, `/trust`, `/packupdate` and `/packdel` always fail.
+
+Besides the cases in [offsets and versions](#offsets-and-versions), the
+call fails, and the input stays as it is, when:
+
+- The message queue has the keyboard after `/queue`.
+- There is nothing to send, or the command palette is open with no
+  command to run.
+- Your plugin lacks a permission listed above.
+- A plugin changed the text, and Enter would refuse it for that plugin,
+  see [chat input](#chat-input).
+
+**Parameters:**
+
+- `{opts}` (`table`) Options:
+  - `version` (`integer`) the version of the text to send, from `maki.ui.input`, `ev.input` or `input_edit`.
+  - `session_id` (`string`) the tab the version was read from.
+
+**Returns:** (`boolean|nil`, `string|nil`) `true` once sent, or nil and an error.
+
+**Example:**
+
+```lua
+-- Spell out `lgtm` before sending:
+maki.keymap.set("i", "<CR>", function(ev)
+  local st = ev.input
+  local s, e = st.text:find("lgtm", 1, true)
+  local version = st.version
+  if s then
+    local r = maki.ui.input_edit({
+      start = s - 1, stop = e, text = "looks good to me",
+      version = st.version, session_id = st.session_id,
+    })
+    if not r then return end
+    version = r.version
+  end
+  maki.ui.input_submit({ version = version, session_id = st.session_id })
+end)
 ```
 
 

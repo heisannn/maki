@@ -167,6 +167,7 @@ pub enum Permission {
     SessionRead,
     SessionWrite,
     SessionSettings,
+    Input,
 }
 
 impl Permission {
@@ -203,6 +204,7 @@ impl Permission {
             Permission::SessionRead => "session_read",
             Permission::SessionWrite => "session_write",
             Permission::SessionSettings => "session_settings",
+            Permission::Input => "input",
         }
     }
 
@@ -228,6 +230,7 @@ impl Permission {
             Permission::SessionSettings => {
                 "changing how a session runs without touching its content: mode, title, model, thinking, fast mode, working directory, and workflow"
             }
+            Permission::Input => "changing the chat input, which is what your next Enter sends",
         }
     }
 }
@@ -456,8 +459,10 @@ pub enum ConfigError {
         #[source]
         source: globset::Error,
     },
-    #[error("invalid config: projects contains invalid glob pattern `{pattern}`: {source}")]
-    InvalidProjectPattern {
+    #[error(
+        "invalid config: instructions.overrides contains invalid glob pattern `{pattern}`: {source}"
+    )]
+    InvalidOverridePattern {
         pattern: String,
         #[source]
         source: globset::Error,
@@ -551,7 +556,6 @@ pub struct RawConfig {
     pub net: NetFileConfig,
     pub trust: TrustFileConfig,
     pub instructions: InstructionsFileConfig,
-    pub projects: Vec<ProjectOverrideFileConfig>,
     pub telemetry: TelemetryConfig,
     pub plugins: HashMap<String, PluginFileConfig>,
 }
@@ -573,9 +577,6 @@ impl RawConfig {
         self.net.merge(overlay.net);
         self.trust.merge(overlay.trust);
         self.instructions.merge(overlay.instructions);
-        if !overlay.projects.is_empty() {
-            self.projects = overlay.projects;
-        }
         self.telemetry.merge(overlay.telemetry);
         for (name, plugin) in overlay.plugins {
             let entry = self.plugins.entry(name).or_default();
@@ -596,7 +597,7 @@ impl RawConfig {
         }
         self.validate_plugin_tables(packages)?;
         let mut agent = AgentConfig::from_file(self.agent);
-        agent.instructions = InstructionsConfig::from_file(self.instructions, self.projects)?;
+        agent.instructions = InstructionsConfig::from_file(self.instructions)?;
         Ok(Config {
             always_yolo: self.always_yolo.unwrap_or(false),
             session_defaults: SessionDefaults {
@@ -944,22 +945,28 @@ pub struct InstructionsFileConfig {
     /// Replaces the built-in file list. An empty list loads no project
     /// instruction files at all; `AGENTS.local.md` still loads.
     pub files: Option<Vec<String>>,
+    /// Per-checkout overrides of `files`, matched by local `path` glob, git
+    /// `remote` glob, or both. The first matching entry wins.
+    pub overrides: Vec<ProjectOverrideFileConfig>,
 }
 
 impl InstructionsFileConfig {
     fn merge(&mut self, overlay: InstructionsFileConfig) {
         merge_option!(self, overlay, files);
+        if !overlay.overrides.is_empty() {
+            self.overrides = overlay.overrides;
+        }
     }
 
     /// Whether the file mentioned instructions at all, so the scope that is
     /// not allowed to set them can warn about exactly the configs that tried.
     pub fn is_set(&self) -> bool {
-        self.files.is_some()
+        self.files.is_some() || !self.overrides.is_empty()
     }
 }
 
-/// One entry of the global `projects` list: a per-checkout override, matched
-/// by local `path` glob, git `remote` glob, or both.
+/// One entry of the `instructions.overrides` list: a per-checkout file list,
+/// matched by local `path` glob, git `remote` glob, or both.
 #[derive(Deserialize, Default, Debug, Clone)]
 #[serde(default, deny_unknown_fields)]
 pub struct ProjectOverrideFileConfig {
@@ -968,7 +975,9 @@ pub struct ProjectOverrideFileConfig {
     /// Glob matched against every git remote URL of the project, normalized
     /// to `host/path` (scheme, user, port and `.git` suffix removed).
     pub remote: Option<String>,
-    pub instructions: Option<InstructionsFileConfig>,
+    /// The file list that applies when this entry matches. `None` keeps the
+    /// global `files`.
+    pub files: Option<Vec<String>>,
 }
 
 #[derive(Deserialize, Default, Debug)]
@@ -1567,9 +1576,8 @@ pub struct AgentConfig {
     pub disabled_tools: Vec<String>,
 
     /// Which instruction files load, and the per-project overrides. Set from
-    /// the top-level `instructions`/`projects` tables in `into_config`, not
-    /// from the `[agent]` section, because only the global `init.lua` may set
-    /// them.
+    /// the top-level `instructions` table in `into_config`, not from the
+    /// `[agent]` section, because only the global `init.lua` may set them.
     #[config(skip, default = "InstructionsConfig::default()")]
     pub instructions: InstructionsConfig,
 }
@@ -1903,46 +1911,41 @@ fn expand_home(pattern: &str) -> String {
     }
 }
 
-/// Resolved `instructions` + `projects` config. Carried on [`AgentConfig`]
-/// so every instruction load sees the same answer.
+/// Resolved `instructions` config. Carried on [`AgentConfig`] so every
+/// instruction load sees the same answer.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct InstructionsConfig {
     /// `None` loads the built-in file list.
     pub files: Option<Vec<String>>,
-    pub projects: Vec<ProjectOverride>,
+    pub overrides: Vec<ProjectOverride>,
 }
 
 impl InstructionsConfig {
-    pub fn from_file(
-        file: InstructionsFileConfig,
-        projects: Vec<ProjectOverrideFileConfig>,
-    ) -> Result<Self, ConfigError> {
-        let mut resolved = Vec::with_capacity(projects.len());
-        for entry in projects {
+    pub fn from_file(file: InstructionsFileConfig) -> Result<Self, ConfigError> {
+        let mut resolved = Vec::with_capacity(file.overrides.len());
+        for entry in file.overrides {
             resolved.push(ProjectOverride {
                 path_matcher: compiled_matcher(entry.path.as_deref(), compile_path_glob)?,
                 remote_matcher: compiled_matcher(entry.remote.as_deref(), compile_remote_glob)?,
                 path: entry.path,
                 remote: entry.remote,
-                files: entry
-                    .instructions
-                    .and_then(|instructions| instructions.files),
+                files: entry.files,
             });
         }
         Ok(Self {
             files: file.files,
-            projects: resolved,
+            overrides: resolved,
         })
     }
 
-    /// Whether any `projects` entry matches on `remote`, so the caller knows
+    /// Whether any `overrides` entry matches on `remote`, so the caller knows
     /// it has to read the project's git remotes before resolving.
     pub fn needs_remotes(&self) -> bool {
-        self.projects.iter().any(|entry| entry.remote.is_some())
+        self.overrides.iter().any(|entry| entry.remote.is_some())
     }
 
     /// The file list that applies to the project at `project_root`, whose git
-    /// remotes are `remotes`. The first matching `projects` entry wins;
+    /// remotes are `remotes`. The first matching `overrides` entry wins;
     /// `default` applies when nothing configured does.
     pub fn resolve_files(
         &self,
@@ -1951,7 +1954,7 @@ impl InstructionsConfig {
         default: &[&str],
     ) -> Vec<String> {
         let mut files = self.files.clone();
-        for entry in &self.projects {
+        for entry in &self.overrides {
             if entry.matches(project_root, remotes) {
                 if let Some(entry_files) = &entry.files {
                     files = Some(entry_files.clone());
@@ -1963,7 +1966,7 @@ impl InstructionsConfig {
     }
 }
 
-/// One `projects` entry, with its matchers precompiled at load.
+/// One `instructions.overrides` entry, with its matchers precompiled at load.
 #[derive(Debug, Clone, Serialize)]
 pub struct ProjectOverride {
     pub path: Option<String>,
@@ -1984,7 +1987,7 @@ fn compiled_matcher(
     };
     compile(pattern)
         .map(Some)
-        .map_err(|source| ConfigError::InvalidProjectPattern {
+        .map_err(|source| ConfigError::InvalidOverridePattern {
             pattern: pattern.to_owned(),
             source,
         })
@@ -2068,8 +2071,8 @@ fn normalize_remote_url(url: &str) -> String {
 /// OpenTelemetry export settings. Every field also has an `OTEL_*` (or
 /// `MAKI_*`) environment variable, which wins over what is set here.
 ///
-/// Fields stay optional: `maki-otel` owns the defaults, resolution and
-/// validation, so the meaning of "unset" is decided in one place.
+/// Fields stay optional: `maki-otel` owns the defaults, so the meaning of
+/// "unset" is decided in one place.
 #[derive(Deserialize, Debug, Clone, ConfigSection)]
 #[serde(default, deny_unknown_fields)]
 #[config(section = "telemetry")]
@@ -2089,24 +2092,24 @@ pub struct TelemetryConfig {
              desc = "Where events go: `otlp`, `console`, `none`, or a comma-separated mix")]
     pub logs_exporter: Option<String>,
 
-    #[config(default = None, ty = "string", default_doc = "-",
+    #[config(default = None, ty = "string", default_doc = "http/json",
              env = "OTEL_EXPORTER_OTLP_PROTOCOL",
-             desc = "OTLP protocol: `grpc`, `http/protobuf`, or `http/json`. Required when an exporter is `otlp`")]
+             desc = "OTLP protocol: `grpc`, `http/protobuf`, or `http/json`")]
     pub protocol: Option<String>,
 
-    #[config(default = None, ty = "string", default_doc = "-",
+    #[config(default = None, ty = "string", default_doc = "http://localhost:4318",
              env = "OTEL_EXPORTER_OTLP_ENDPOINT",
-             desc = "Collector endpoint. HTTP appends `/v1/metrics` and `/v1/logs`")]
+             desc = "Collector endpoint. HTTP appends `/v1/metrics` and `/v1/logs`. The gRPC default is `http://localhost:4317`")]
     pub endpoint: Option<String>,
 
     #[config(default = None, ty = "table", default_doc = "{}",
              env = "OTEL_EXPORTER_OTLP_HEADERS",
-             desc = "Extra headers sent with every export")]
+             desc = "Headers sent with every export")]
     pub headers: Option<BTreeMap<String, String>>,
 
     #[config(default = None, ty = "integer", default_doc = "10000",
              env = "OTEL_EXPORTER_OTLP_TIMEOUT",
-             desc = "Per-export request timeout (ms)")]
+             desc = "Deadline for one export, retries included (ms)")]
     pub timeout_ms: Option<u64>,
 
     #[config(default = None, ty = "string", default_doc = "none",
@@ -2131,7 +2134,7 @@ pub struct TelemetryConfig {
 
     #[config(default = None, ty = "integer", default_doc = "-",
              env = "OTEL_EXPORTER_OTLP_METRICS_TIMEOUT",
-             desc = "Metrics-only request timeout (ms)")]
+             desc = "Metrics-only export deadline (ms)")]
     pub metrics_timeout_ms: Option<u64>,
 
     #[config(default = None, ty = "string", default_doc = "-",
@@ -2151,7 +2154,7 @@ pub struct TelemetryConfig {
 
     #[config(default = None, ty = "integer", default_doc = "-",
              env = "OTEL_EXPORTER_OTLP_LOGS_TIMEOUT",
-             desc = "Logs-only request timeout (ms)")]
+             desc = "Logs-only export deadline (ms)")]
     pub logs_timeout_ms: Option<u64>,
 
     #[config(default = None, ty = "integer", default_doc = "60000",
@@ -2159,19 +2162,14 @@ pub struct TelemetryConfig {
              desc = "How often metrics are exported (ms)")]
     pub metrics_interval_ms: Option<u64>,
 
-    #[config(default = None, ty = "integer", default_doc = "30000",
-             env = "OTEL_METRIC_EXPORT_TIMEOUT",
-             desc = "Deadline for one metrics export, retries included (ms)")]
-    pub metrics_export_timeout_ms: Option<u64>,
-
-    #[config(default = None, ty = "integer", default_doc = "5000",
+    #[config(default = None, ty = "integer", default_doc = "1000",
              env = "OTEL_LOGS_EXPORT_INTERVAL, OTEL_BLRP_SCHEDULE_DELAY",
              desc = "How often queued events are flushed (ms)")]
     pub logs_interval_ms: Option<u64>,
 
     #[config(default = None, ty = "integer", default_doc = "2048",
              env = "OTEL_BLRP_MAX_QUEUE_SIZE",
-             desc = "Event queue capacity. Events are dropped and counted when it is full")]
+             desc = "Event queue capacity, at most 65536. Events are dropped when it is full")]
     pub logs_max_queue_size: Option<usize>,
 
     #[config(default = None, ty = "integer", default_doc = "512",
@@ -2179,14 +2177,9 @@ pub struct TelemetryConfig {
              desc = "Maximum events per export request")]
     pub logs_max_export_batch_size: Option<usize>,
 
-    #[config(default = None, ty = "integer", default_doc = "30000",
-             env = "OTEL_BLRP_EXPORT_TIMEOUT",
-             desc = "Deadline for one events export, retries included (ms)")]
-    pub logs_export_timeout_ms: Option<u64>,
-
     #[config(default = None, ty = "string", default_doc = "delta",
              env = "OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE",
-             desc = "Metric temporality: `delta` or `cumulative`")]
+             desc = "Metric temporality: `cumulative`, `delta` or `lowmemory`")]
     pub metrics_temporality: Option<String>,
 
     #[config(default = None, ty = "string", default_doc = "maki",
@@ -2247,11 +2240,9 @@ impl TelemetryConfig {
             logs_headers,
             logs_timeout_ms,
             metrics_interval_ms,
-            metrics_export_timeout_ms,
             logs_interval_ms,
             logs_max_queue_size,
             logs_max_export_batch_size,
-            logs_export_timeout_ms,
             metrics_temporality,
             service_name,
             resource_attributes,
@@ -3420,9 +3411,9 @@ mod tests {
 
     fn instructions_config(
         files: Option<Vec<String>>,
-        projects: Vec<ProjectOverrideFileConfig>,
+        overrides: Vec<ProjectOverrideFileConfig>,
     ) -> InstructionsConfig {
-        InstructionsConfig::from_file(InstructionsFileConfig { files }, projects)
+        InstructionsConfig::from_file(InstructionsFileConfig { files, overrides })
             .expect("valid patterns")
     }
 
@@ -3483,16 +3474,12 @@ mod tests {
                 },
                 ProjectOverrideFileConfig {
                     path: Some("/workspace".into()),
-                    instructions: Some(InstructionsFileConfig {
-                        files: Some(Vec::new()),
-                    }),
+                    files: Some(Vec::new()),
                     ..Default::default()
                 },
                 ProjectOverrideFileConfig {
                     path: Some("/workspace".into()),
-                    instructions: Some(InstructionsFileConfig {
-                        files: Some(vec!["GEMINI.md".into()]),
-                    }),
+                    files: Some(vec!["GEMINI.md".into()]),
                     ..Default::default()
                 },
             ],
@@ -3525,9 +3512,7 @@ mod tests {
             None,
             vec![ProjectOverrideFileConfig {
                 remote: Some("github.com/example/*".into()),
-                instructions: Some(InstructionsFileConfig {
-                    files: Some(Vec::new()),
-                }),
+                files: Some(Vec::new()),
                 ..Default::default()
             }],
         );
@@ -3568,49 +3553,52 @@ mod tests {
     #[test_case(None, Some(BROKEN_GLOB) ; "remote_glob_is_a_config_error")]
     fn invalid_project_pattern_is_a_config_error(path: Option<&str>, remote: Option<&str>) {
         let result = RawConfig {
-            projects: vec![ProjectOverrideFileConfig {
-                path: path.map(str::to_owned),
-                remote: remote.map(str::to_owned),
+            instructions: InstructionsFileConfig {
+                overrides: vec![ProjectOverrideFileConfig {
+                    path: path.map(str::to_owned),
+                    remote: remote.map(str::to_owned),
+                    ..Default::default()
+                }],
                 ..Default::default()
-            }],
+            },
             ..Default::default()
         }
         .into_config(&[]);
 
         assert!(matches!(
             result,
-            Err(ConfigError::InvalidProjectPattern { pattern, .. }) if pattern == BROKEN_GLOB
+            Err(ConfigError::InvalidOverridePattern { pattern, .. }) if pattern == BROKEN_GLOB
         ));
     }
 
     #[test]
-    fn instructions_merge_and_projects_replace() {
+    fn instructions_merge_and_overrides_replace() {
         let mut base = RawConfig {
             instructions: InstructionsFileConfig {
                 files: Some(vec!["AGENTS.md".into()]),
+                overrides: vec![ProjectOverrideFileConfig {
+                    path: Some("/base".into()),
+                    ..Default::default()
+                }],
             },
-            projects: vec![ProjectOverrideFileConfig {
-                path: Some("/base".into()),
-                ..Default::default()
-            }],
             ..Default::default()
         };
         base.merge(RawConfig {
             instructions: InstructionsFileConfig {
                 files: Some(vec!["CLAUDE.md".into()]),
+                overrides: vec![ProjectOverrideFileConfig {
+                    path: Some("/overlay".into()),
+                    ..Default::default()
+                }],
             },
-            projects: vec![ProjectOverrideFileConfig {
-                path: Some("/overlay".into()),
-                ..Default::default()
-            }],
             ..Default::default()
         });
 
         let agent = base.into_config(&[]).unwrap().agent;
         assert_eq!(agent.instructions.files, Some(vec!["CLAUDE.md".to_owned()]));
-        assert_eq!(agent.instructions.projects.len(), 1);
+        assert_eq!(agent.instructions.overrides.len(), 1);
         assert_eq!(
-            agent.instructions.projects[0].path.as_deref(),
+            agent.instructions.overrides[0].path.as_deref(),
             Some("/overlay")
         );
     }
@@ -4485,6 +4473,7 @@ mod tests {
     #[test_case("agent = { bash_timeout_secs = 60 }\n" ; "moved_bash_timeout")]
     #[test_case("agent = { search_result_limit = 50 }\n" ; "moved_search_limit")]
     #[test_case("[index]\nmax_file_size_mb = 4\n" ; "removed_index_section")]
+    #[test_case("[telemetry]\nmetrics_export_timeout_ms = 5000\n" ; "removed_telemetry_timeout")]
     fn deny_unknown_fields_rejects(toml_str: &str) {
         let result: Result<RawConfig, _> = toml::from_str(toml_str);
         assert!(

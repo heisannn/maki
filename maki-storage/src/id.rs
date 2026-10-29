@@ -33,7 +33,7 @@ pub enum MakiIdParseError {
 /// and don't sort by time regardless. Nothing in maki sorts by the string
 /// form today; storage uses the embedded timestamp directly. See issue
 /// #264 for future tree-ordered history work.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct MakiId([u8; UUID_BYTES]);
 
 impl MakiId {

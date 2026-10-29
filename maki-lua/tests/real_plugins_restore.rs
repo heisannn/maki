@@ -2,19 +2,27 @@
 //! A broken restore silently falls back to raw LLM output, so we assert
 //! things only the real views produce (gutters, command headers, truncation).
 
+use std::path::Path;
 use std::sync::Arc;
 
-use maki_agent::AgentEvent;
 use maki_agent::tools::ToolRegistry;
+use maki_agent::{AgentEvent, EventSender, SpanStyle};
 use maki_config::ToolOutputLines;
+use maki_highlight::highlight_code;
 use maki_lua::{PluginHost, RestoreReason, Split, UiAction};
-use maki_storage::id::SessionRef;
+use maki_storage::id::{MakiId, SessionRef};
 use serde_json::{Value, json};
 
 const BASH_SRC: &str = include_str!("../../plugins/bash/init.lua");
 const GREP_SRC: &str = include_str!("../../plugins/grep/init.lua");
 const BATCH_SRC: &str = include_str!("../../plugins/batch/init.lua");
 const TODO_SRC: &str = include_str!("../../plugins/todo_write/init.lua");
+const READ_SRC: &str = include_str!("../../plugins/read/init.lua");
+const READ_PADDING_LINES: usize = 300;
+const READ_PADDING_BYTES: usize = 128;
+const READ_COMMENT: &str = "/* comment";
+const READ_EXCERPT: &str = "let value = 1;";
+const READ_LANG: &str = "rust";
 
 /// Only the real ToolView emits this when collapsed.
 const EXPAND_HINT: &str = "click to expand";
@@ -133,6 +141,57 @@ fn run_restore(host: &PluginHost, item: maki_lua::RestoreItem) -> Restored {
         }
     }
     out
+}
+
+#[test_case::test_case("\n"; "lf")]
+#[test_case::test_case("\r\n"; "crlf")]
+fn read_restore_keeps_nearby_comment_colors_with_large_context(ending: &str) {
+    let dir = tempfile::TempDir::new().unwrap();
+    let shallow = dir.path().join("shallow.rs");
+    let deep = dir.path().join("deep.rs");
+    let source = format!("{READ_COMMENT}{ending}{READ_EXCERPT}{ending}");
+    let padding = format!("// {}{ending}", "x".repeat(READ_PADDING_BYTES));
+    let deep_source = format!("{}{source}", padding.repeat(READ_PADDING_LINES));
+    std::fs::write(&shallow, &source).unwrap();
+    std::fs::write(&deep, &deep_source).unwrap();
+    // Restore tasks get 10s, and compiling rust regexes in a cold debug build can take longer.
+    highlight_code(READ_LANG, &deep_source, "");
+
+    let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+    host.load_source("read", READ_SRC).unwrap();
+    let render = |path: &Path, offset: usize| {
+        let handle = host.event_handle();
+        let (tx, rx) = flume::unbounded();
+        handle.request_restore(
+            restore_item(
+                "read",
+                json!({ "path": path, "offset": offset, "limit": 1 }),
+                &format!("{offset}: {READ_EXCERPT}"),
+                None,
+                Vec::new(),
+            ),
+            EventSender::new(tx, 0),
+        );
+        handle.wait_restore_complete_for_test();
+        host.load_source("barrier", "").unwrap();
+        let snapshot = rx
+            .drain()
+            .filter_map(|env| match env.event {
+                AgentEvent::ToolSnapshot { snapshot, .. } => Some(snapshot),
+                _ => None,
+            })
+            .last()
+            .expect("no restored read snapshot");
+        assert_eq!(snapshot.text(), format!("{offset} {READ_EXCERPT}"));
+        let spans = snapshot.lines[0].spans[1..].to_vec();
+        assert!(
+            spans
+                .iter()
+                .any(|span| matches!(span.style, SpanStyle::Inline(_)))
+        );
+        spans
+    };
+    assert_eq!(render(&deep, READ_PADDING_LINES + 2), render(&shallow, 2));
 }
 
 #[test]
@@ -443,6 +502,37 @@ fn todo_load_restore_leaves_the_panel_closed() {
         |action| matches!(action, UiAction::OpenWin { config, .. } if config.split == Split::Panel),
     );
     assert!(!opened, "a load restore must not refill the panel");
+}
+
+/// Each tab gets a panel of its own. The plugin used to share one window, and
+/// it stayed in the tab it first opened in, so every other tab's list was
+/// drawn there, out of sight.
+#[test]
+fn todo_panel_opens_in_the_tab_of_each_writing_session() {
+    let reg = Arc::new(ToolRegistry::new());
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_source(TODO_TOOL, TODO_SRC).unwrap();
+    let sessions = [MakiId::generate(), MakiId::generate()];
+    let input = json!({ "todos": [{ "content": TODO_ITEM, "status": "in_progress" }] });
+    let tool = &reg.get(TODO_TOOL).unwrap().tool;
+
+    for session in sessions {
+        let mut ctx = maki_agent::tools::test_support::stub_ctx(&maki_agent::AgentMode::Build);
+        ctx.session_id = Some(SessionRef::from_id(session));
+        smol::block_on(tool.parse(&input).unwrap().execute(&ctx));
+    }
+
+    let owners: Vec<_> = host
+        .ui_action_rx()
+        .drain()
+        .filter_map(|action| match action {
+            UiAction::OpenWin {
+                session, config, ..
+            } if config.split == Split::Panel => Some(session),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(owners, sessions.map(Some));
 }
 
 const WHICH_TASK_SRC: &str = r#"

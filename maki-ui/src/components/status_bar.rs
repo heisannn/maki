@@ -11,12 +11,13 @@ use crate::animation::spinner_frame;
 use crate::theme;
 
 use maki_providers::format_tokens;
-use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
+use notify::{Config, Error, Event, EventKindMask, RecommendedWatcher, RecursiveMode, Watcher};
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
+use tracing::warn;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::repaint::{Cadence, Dirty};
@@ -228,6 +229,13 @@ impl StatusBar {
 
         let mut right_spans = Vec::new();
 
+        // A flash answers what the user just did, while the path and the
+        // model sit there all day. So they shrink to make room for it.
+        let flash_span = self
+            .flash
+            .as_ref()
+            .map(|(msg, _)| Span::styled(format!(" {msg}"), theme::current().status_notice));
+
         // An error takes the whole bar over. The label saying the agent
         // approves everything has to survive that, so it is built out here
         // and both arms place it.
@@ -303,6 +311,7 @@ impl StatusBar {
                 let reserved = left_spans
                     .iter()
                     .chain(rest_spans.iter())
+                    .chain(flash_span.iter())
                     .map(Span::width)
                     .sum::<usize>()
                     + CWD_MODEL_SEPARATOR.width();
@@ -317,12 +326,7 @@ impl StatusBar {
             }
         }
 
-        if let Some((ref msg, _)) = self.flash {
-            left_spans.push(Span::styled(
-                format!(" {msg}"),
-                theme::current().status_notice,
-            ));
-        }
+        left_spans.extend(flash_span);
 
         let [left_area, right_area] = Layout::horizontal([
             Constraint::Min(0),
@@ -408,17 +412,29 @@ fn find_git_dir(cwd: &Path) -> Option<std::path::PathBuf> {
     }
 }
 
+/// Access events are left out. Reading `HEAD` is one, so a watcher that
+/// took them would wake the poll that reads it, and that read would wake
+/// it again, every tick for as long as the app runs.
 fn watch_branch() -> Option<(flume::Receiver<()>, RecommendedWatcher)> {
     let cwd = env::current_dir().ok()?;
     let git_dir = find_git_dir(&cwd)?;
     let (tx, rx) = flume::bounded(1);
-    let mut watcher = notify::recommended_watcher(move |res: Result<Event, _>| {
+    let on_event = move |res: Result<Event, _>| {
         if res.is_ok_and(|e| e.paths.iter().any(|p| p.ends_with("HEAD"))) {
             let _ = tx.try_send(());
         }
-    })
-    .ok()?;
-    watcher.watch(&git_dir, RecursiveMode::NonRecursive).ok()?;
+    };
+    let config = Config::default().with_event_kinds(EventKindMask::CORE);
+    let unavailable = |e: &Error| {
+        warn!(error = %e, git_dir = %git_dir.display(), "git branch watcher unavailable");
+    };
+    let mut watcher = RecommendedWatcher::new(on_event, config)
+        .inspect_err(unavailable)
+        .ok()?;
+    watcher
+        .watch(&git_dir, RecursiveMode::NonRecursive)
+        .inspect_err(unavailable)
+        .ok()?;
     Some((rx, watcher))
 }
 
@@ -440,6 +456,9 @@ mod tests {
     const EXPECT_TICKING: &str = "a waiting message has to claim the frames that advance it";
     const EXPECT_NEWEST: &str = "a flash answers the user's last action, not an earlier one";
     const STALE_BRANCH: &str = "/nowhere:gone";
+    const LONG_CWD: &str = "~/projects/a/rather/deep/folder/for/this/repository:feature/branch";
+    const LONG_FLASH: &str =
+        "a plugin wrote part of this shell line: retype it yourself in a fresh input";
     const BAR_WIDTH: u16 = 120;
     const MODEL_ID: &str = "test-model";
     const CONTEXT_SIZE: u32 = 12_000;
@@ -468,7 +487,10 @@ mod tests {
     }
 
     fn draw(ctx: &StatusBarContext<'_>) -> String {
-        let bar = StatusBar::new(FLASH_TTL);
+        draw_bar(&StatusBar::new(FLASH_TTL), ctx)
+    }
+
+    fn draw_bar(bar: &StatusBar, ctx: &StatusBarContext<'_>) -> String {
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(BAR_WIDTH, 1)).unwrap();
         terminal.draw(|f| bar.view(f, f.area(), ctx)).unwrap();
@@ -547,6 +569,19 @@ mod tests {
     #[test_case(false => false ; "a_prompting_session_stays_quiet")]
     fn the_bar_advertises_yolo(yolo: bool) -> bool {
         render(None, false, yolo).contains(YOLO_LABEL.trim())
+    }
+
+    /// The path and the model are there all day, so a message answering
+    /// what the user just did is read in full before them.
+    #[test]
+    fn a_flash_pushes_the_path_and_model_aside() {
+        let mut bar = StatusBar::new(FLASH_TTL);
+        bar.cwd_branch = LONG_CWD.into();
+        bar.flash(LONG_FLASH.into());
+
+        let text = draw_bar(&bar, &context(&Status::Idle, None, false, false));
+
+        assert!(text.contains(LONG_FLASH), "{text}");
     }
 
     #[test]

@@ -24,7 +24,7 @@ jobs:
     name: Create Release
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Create draft release
         run: |
@@ -45,16 +45,19 @@ jobs:
             runner: ubuntu-24.04-arm
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Build in Alpine container
+        env:
+          # renovate: datasource=docker depName=alpine
+          ALPINE_VERSION: "3.24"
         run: |
           docker run --rm \
             -v "${{ github.workspace }}:/workspace" \
             -w /workspace \
             -e CARGO_TERM_COLOR=always \
             -e CARGO_INCREMENTAL=0 \
-            alpine:3.21 sh -c '
+            "alpine:${ALPINE_VERSION}" sh -c '
               apk add --no-cache gcc g++ musl-dev make linux-headers curl git ca-certificates pkgconf python3-dev
               git config --global --add safe.directory /workspace
               curl --proto "=https" --tlsv1.2 --retry 5 --retry-delay 2 --retry-all-errors -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --target ${{ matrix.target }}
@@ -95,14 +98,15 @@ jobs:
             std: build-std
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # zig bundles NetBSD 10.1 libc headers, crt objects and stub shared
       # libraries, so it is a self-contained NetBSD cross toolchain: Ubuntu has
       # no gcc-*-netbsd packages and NetBSD ships no cross kits for Linux.
       - name: Install zig
         env:
-          ZIG_VERSION: 0.16.0
+          # renovate: datasource=forgejo-tags depName=ziglang/zig registryUrl=https://codeberg.org
+          ZIG_VERSION: 0.17.0
         run: |
           .github/scripts/retry.sh curl -sSfL -o "$RUNNER_TEMP/zig.tar.xz" "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
           tar xJf "$RUNNER_TEMP/zig.tar.xz" -C "$HOME"
@@ -165,7 +169,7 @@ jobs:
             echo "CARGO_TARGET_${U}_LINKER=$w/linker"
           } >> "$GITHUB_ENV"
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: ${{ matrix.target }}-${{ github.ref_name }}
 
@@ -207,13 +211,13 @@ jobs:
             runner: windows-latest
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           targets: ${{ matrix.target }}
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: ${{ matrix.target }}-${{ github.ref_name }}
 
@@ -248,7 +252,7 @@ jobs:
     needs: [build-linux, build-netbsd, build-other]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Download artifacts
         run: .github/scripts/retry.sh gh release download "$GITHUB_REF_NAME" --dir artifacts

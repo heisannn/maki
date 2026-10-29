@@ -321,7 +321,7 @@ pub struct Keybind {
 pub const KEYBINDS: &[Keybind] = &[
     Keybind {
         label: KeyLabel::Single(key::QUIT.label),
-        description: "Quit / clear input",
+        description: "Quit / clear input / copy selection",
         context: KeybindContext::General,
         platform: Platform::All,
     },
@@ -384,7 +384,7 @@ pub const KEYBINDS: &[Keybind] = &[
     },
     Keybind {
         label: KeyLabel::Single("Tab"),
-        description: "Toggle mode",
+        description: "Switch between plan and build",
         context: KeybindContext::Editing,
         platform: Platform::All,
     },
@@ -403,6 +403,12 @@ pub const KEYBINDS: &[Keybind] = &[
     Keybind {
         label: KeyLabel::MacMulti(&["Alt+←", "Alt+→"], &["⌥←", "⌥→"]),
         description: "Move word left / right",
+        context: KeybindContext::Editing,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single("Shift+motion"),
+        description: "Select text",
         context: KeybindContext::Editing,
         platform: Platform::All,
     },

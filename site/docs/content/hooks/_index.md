@@ -359,8 +359,8 @@ maki.api.set_slot("completion.sources", function(prev, sources)
       if not out then
         return items
       end
-      for num, title in out.stdout:gmatch("(%d+)%s+%S+%s+([^\t]+)") do
-        table.insert(items, { text = "#" .. num, label = "#" .. num .. " " .. title })
+      for num in out.stdout:gmatch("(%d+)%s+%S+%s+[^\t]+") do
+        table.insert(items, { text = "#" .. num })
       end
       return items
     end,
@@ -375,9 +375,13 @@ end)
 | `name` | unique across sources. A second source with the same name is ignored. |
 | `complete` | `function(query, ctx)` returning items. `query` is the text after the trigger. |
 
-An item is `{ text, label, score }`. `text` replaces the mention, and `label` is
-what the row shows (default `text`). Rows sort by `score`, highest first. File
-rows score `0` and win ties, so use a positive score to rank above them.
+An item is `{ text, label, score }`. The row shows `text`, and Enter puts it and
+a space in place of the mention. An item whose `text` does not fit on one row is
+left out: one with a line break or another control character, a character that
+hides or reorders text, or more than 120 bytes. `label` is optional and only
+shown: it is drawn dim after `text` on the same row and cut to 60 characters.
+Rows sort by `score`, highest first. File rows score `0` and win ties, so use a
+positive score to rank above them.
 
 On each keystroke, maki asks every source for that trigger in parallel and
 shows rows as they arrive. A newer keystroke replaces the query, and a source
@@ -388,6 +392,9 @@ shows no rows, and the error is logged.
 
 `complete` runs with the permissions of the plugin that wrote it, so the example
 needs `run` as well.
+
+The popup does not open on a `!` line. Completion holds no `run`, so Enter
+would refuse a shell line it completed.
 
 ## Permission prompt
 

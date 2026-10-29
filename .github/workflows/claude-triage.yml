@@ -12,7 +12,9 @@ on:
 
 jobs:
   triage:
-    if: github.event_name == 'workflow_dispatch' || github.event.issue.labels[0] == null
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.issue.labels[0] == null && github.event.issue.user.type != 'Bot')
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -29,11 +31,11 @@ jobs:
           sudo apt-get update -qq && sudo apt-get install -y -qq bubblewrap socat
           && sudo sysctl -qw kernel.apparmor_restrict_unprivileged_userns=0
       - run: npm install -g @anthropic-ai/claude-code
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
-      - uses: actions/create-github-app-token@v3
+      - uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         id: app-token
         if: vars.REVIEW_APP_ID != ''
         with:

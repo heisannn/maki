@@ -1,6 +1,7 @@
 pub mod agent_autocmd;
 mod api;
 mod background;
+pub mod chunks;
 pub mod docs;
 pub mod docs_render;
 mod error;
@@ -14,22 +15,29 @@ pub(crate) mod plugin_permissions;
 mod runtime;
 pub mod session_snapshot;
 
+pub use api::action::ActionInfo;
 pub use api::r#fn::set_shell_preference;
-pub use api::keymap::{KeybindTicket, KeymapEntry, KeymapReader, KeymapSnapshot};
+pub use api::keymap::{
+    InputMode, InputSnapshot, KeybindTicket, KeymapEntry, KeymapReader, KeymapSnapshot,
+};
 pub use api::net::set_allowed_private_hosts;
 pub use api::options::{OptionSpec, OptionType, PluginOptionSpecs};
 pub use api::pack::{Declared, PackOp};
 pub use api::session::SessionSnapshotFn;
+pub use api::ui::marks::{
+    Decoration, InputRule, InputRulesReader, Mark, PatternRule, Reveal, VirtTextPos,
+};
+pub use api::ui::syntax::{SyntaxDoc, SyntaxEdit, SyntaxIndex, SyntaxInput, SyntaxRule};
 pub use api::util::command::{
-    Anchor, Axis, Border, BuiltinAction, Dimension, Edge, FloatConfig, FloatConfigPatch,
-    HintReader, HintSnapshot, InputEdit, InputRequest, LuaCommandInfo, LuaCommandReader,
-    ModelRequest, NO_UI_ERR, PlanActionOutcome, PlanFormRow, PlanMenu, PlanRequest, PlanRowAction,
-    SessionRequest, Split, TaskRequest, TitlePos, UiAction, UiAttachment, UiReply, WinCommand,
-    WinEvent, WinView,
+    Anchor, Axis, Border, BuiltinAction, Dimension, Edge, FloatConfig, FloatConfigPatch, HintEntry,
+    HintReader, HintSnapshot, InputDecorate, InputEdit, InputMarks, InputRequest, InputSubmit,
+    LuaCommandInfo, LuaCommandReader, ModelRequest, NO_UI_ERR, PlanActionOutcome, PlanFormRow,
+    PlanMenu, PlanRequest, PlanRowAction, SessionRequest, Split, TaskRequest, TextEdit, TitlePos,
+    UiAction, UiAttachment, UiReply, WinCommand, WinEvent, WinView,
 };
 pub use docs::{DocKind, FnDoc, ModuleDoc, ParamDoc, api_docs};
 pub use error::PluginError;
-pub use key::{Key, RESERVED_KEYS, is_reserved};
+pub use key::{Key, PASTE, RESERVED_KEYS, is_reserved};
 pub use key_lint::KEY_WARNING;
 pub use loader::{
     EventHandle, InitFiles, PERMISSION_NAME_WARNING, PluginHost, SKIPPED_PLUGIN_WARNING,
@@ -41,29 +49,29 @@ pub use pack::{
     UpdateTarget, apply_pack_plan, approvals_path, discover, discover_installed, install_declared,
     installed_names, lockfile_path, prepare_pack_command, sanitize_message, site_dir,
 };
-pub use plugin_permissions::{Missing, Permission, PluginPermissions, PluginReach, Requested};
+pub use plugin_permissions::{
+    Missing, Permission, PluginPermissions, PluginReach, Requested, SENDS_PROMPT,
+};
 pub use runtime::{
     KILL_GRACE, MAX_INFLIGHT_TOOLS, PLAN_FORM_SLOT_DEADLINE, PLAN_ROW_HANDLER_DEADLINE,
-    RestoreItem, RestoreReason, WARM_TOOL_CAP,
+    RestoreItem, RestoreReason, SLICE_WARN, WARM_TOOL_CAP,
 };
 pub use session_snapshot::{SessionQueueSnapshot, SessionSnapshot};
 
 pub mod test_support {
     use std::sync::Arc;
 
-    use crate::KeymapReader;
-    use crate::SessionEndReason;
     pub use crate::api::autocmd::content_omitted_message;
-    use crate::api::keymap::KeymapWriter;
+    use crate::api::keymap::{InputMode, KeymapStore, KeymapWriter, SetOpts};
     use crate::api::util::command::{
         HintEntries, HintReader, HintWriter, LuaCommandInfo, LuaCommandReader, LuaCommandWriter,
     };
     pub use crate::api::util::dispatch::MAX_HOOK_DEPTH;
     use crate::key::Key;
     pub use crate::runtime::layer_skipped_message;
+    use crate::{KeybindTicket, KeymapReader, PluginPermissions, SessionEndReason};
+    use maki_agent::SharedBuf;
     use maki_storage::id::MakiId;
-
-    const TEST_PLUGIN: &str = "test-plugin";
 
     pub struct LuaCommandWriterHandle(LuaCommandWriter);
 
@@ -134,10 +142,16 @@ pub mod test_support {
         /// test that types cannot tell a dispatched binding from an announced
         /// edit without this.
         pub fn try_recv_keybind(&self) -> Option<Key> {
+            self.try_recv_ticket().map(|ticket| ticket.key())
+        }
+
+        /// [`Self::try_recv_keybind`] with the whole ticket, for a test that
+        /// plays the Lua thread and reports the handler done.
+        pub fn try_recv_ticket(&self) -> Option<KeybindTicket> {
             use crate::runtime::Request;
             while let Ok(req) = self.0.try_recv() {
                 if let Request::RunKeybindCallback { ticket } = req {
-                    return Some(ticket.key());
+                    return Some(ticket);
                 }
             }
             None
@@ -189,18 +203,39 @@ pub mod test_support {
         (handle.layering(&[crate::api::slot::PLAN_FORM_SLOT]), probe)
     }
 
-    /// Publishes {binds} as one plugin's global keymap. The Lua state the
-    /// callbacks come from is dropped here: a host test hands the binding back
-    /// to a probe instead of calling it.
-    pub fn keymap_reader_with(binds: Vec<Key>) -> KeymapReader {
+    /// Switches {reader}'s mode the way `maki.ui.set_mode` would.
+    pub fn set_mode(reader: &KeymapReader, mode: InputMode) {
+        reader.mode.set(mode);
+    }
+
+    /// One binding for [`keymap_reader_from`], global when `buffer` is `None`.
+    pub struct TestBinding<'a> {
+        pub plugin: &'a str,
+        pub modes: &'a [InputMode],
+        pub key: Key,
+        pub buffer: Option<&'a Arc<SharedBuf>>,
+    }
+
+    /// Publishes {binds}, set in order, so a later one shadows an earlier one
+    /// in its scope the way a later `maki.keymap.set` would.
+    pub fn keymap_reader_from(binds: &[TestBinding]) -> KeymapReader {
         let lua = mlua::Lua::new();
-        let mut store = crate::api::keymap::KeymapStore::new();
-        let plugin: Arc<str> = Arc::from(TEST_PLUGIN);
-        for key in binds {
+        let mut store = KeymapStore::new();
+        for bind in binds {
             let callback = lua
                 .create_registry_value(lua.create_function(|_, ()| Ok(())).unwrap())
                 .unwrap();
-            store.set(key, callback, Arc::clone(&plugin), String::new(), false);
+            store.set(
+                bind.key,
+                bind.modes,
+                callback,
+                Arc::from(bind.plugin),
+                PluginPermissions::trusted(),
+                SetOpts {
+                    buffer: bind.buffer.map(Arc::downgrade),
+                    ..Default::default()
+                },
+            );
         }
         let (writer, reader) = KeymapWriter::new();
         writer.publish(store.snapshot_entries());

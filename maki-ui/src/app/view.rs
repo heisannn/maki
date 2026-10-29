@@ -48,8 +48,9 @@ impl App {
 
     /// Whether a plugin writing to the chat input would land in a box the
     /// user can see: nothing covering it, no form in the bottom panel, and a
-    /// {area} tall enough to leave the box a text row. An overlay counts even when it only takes the keyboard, because
-    /// the user is reading it and not the draft.
+    /// {area} tall enough to leave the box a text row. An overlay counts
+    /// even when it only takes the keyboard, because the user is reading it
+    /// and not the draft.
     ///
     /// Worked out from state on every ask rather than recorded while
     /// painting: a whole batch of wakes is handled between two frames, so a
@@ -308,7 +309,7 @@ impl App {
         if r.width > 0 {
             overlay_rect = r;
         }
-        let r = self.help_modal.view(frame, full);
+        let r = self.help_modal.view(frame, full, &self.keymap_reader);
         if r.width > 0 {
             overlay_rect = r;
         }
@@ -464,18 +465,14 @@ impl App {
     }
 
     fn lua_hint_line(&self) -> Option<Line<'static>> {
-        let snap = self.hints.get()?;
-        if snap.entries.is_empty() {
-            return None;
-        }
-        let mut spans = Vec::new();
-        for (_, pairs) in &snap.entries {
-            for (text, style_name) in pairs {
-                let style = theme::style_by_name(style_name);
-                spans.push(Span::styled(text.clone(), style));
-            }
-        }
-        Some(Line::from(spans))
+        let spans: Vec<_> = self
+            .hints
+            .get()?
+            .visible_in(self.state.session.id)
+            .flat_map(|entry| &entry.spans)
+            .map(|(text, style_name)| Span::styled(text.clone(), theme::style_by_name(style_name)))
+            .collect();
+        (!spans.is_empty()).then(|| Line::from(spans))
     }
 
     #[cfg(test)]

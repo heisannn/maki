@@ -1,3 +1,4 @@
+use super::mouse::FLASH_COPIED;
 use super::session::{FORK_EMPTY_MSG, FORK_TITLE_PREFIX};
 use super::*;
 use crate::AppSession;
@@ -5,15 +6,18 @@ use crate::agent::shared_queue;
 use crate::app::tasks::TaskStatus;
 use crate::chat::{CANCELLED_TEXT, DONE_TEXT, ERROR_TEXT, INBOX_DROPPED_SUFFIX};
 use crate::components::btw_modal::BtwEvent;
-use crate::components::command::{ParsedCommand, USER_ONLY_SUFFIX, missing_refusal};
+use crate::components::command::{PROMPT_NEEDS, ParsedCommand, USER_ONLY_SUFFIX};
 use crate::components::file_picker::UNREADABLE_DIR_MSG;
 use crate::components::keybindings::{KeybindContext, key as kb};
 use crate::components::messages::ScrollPos;
 use crate::components::rewind_picker::RewindEntry;
 use crate::components::split_layout::MIN_CHAT_ROWS;
 use crate::components::{ExitRequest, buffer_text, key, test_model};
+use crate::decor_worker;
+use crate::highlight::TAB_SPACES;
 use crate::repaint::expect::{OWED, QUIET};
 use crate::selection::{RowPos, SelectableZone, SelectionState, SelectionZone};
+use crate::text_buffer::{Decoration, EDIT_CONFLICT_ERR, INPUT_REPLACED_ERR, Mark};
 use crate::theme;
 use arc_swap::ArcSwap;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
@@ -21,17 +25,25 @@ use maki_agent::agent::TranscriptError;
 use maki_agent::command::{CommandScope, CustomCommand};
 use maki_agent::permissions::{PermissionAnswer, PermissionManager};
 use maki_agent::session::NOTHING_TO_STORE;
+use maki_agent::tools::ToolRegistry;
 use maki_agent::{
-    AgentMode, DoneReason, HistorySnapshot, ImageMediaType, McpConfigErrors, McpServerInfo,
-    McpServerStatus, McpSnapshot, McpSnapshotReader, SharedBuf, SteerKind, SubagentInbox,
-    ToolDoneEvent, ToolOutput, ToolStartEvent, Transcript, TurnCompleteEvent,
+    AgentMode, DoneReason, HistorySnapshot, ImageMediaType, McpConfigErrors, McpPromptArg,
+    McpPromptInfo, McpServerInfo, McpServerStatus, McpSnapshot, McpSnapshotReader, SharedBuf,
+    SteerKind, SubagentInbox, ToolDoneEvent, ToolOutput, ToolStartEvent, Transcript,
+    TurnCompleteEvent,
 };
-use maki_config::{Effect, PermissionRule, PermissionsConfig, ProjectConfig, ToolKey, UiConfig};
-use maki_lua::test_support::{HintWriterHandle, hint_writer_pair};
+use maki_config::{
+    Effect, PermissionRule, PermissionsConfig, PluginsConfig, ProjectConfig, ToolKey, UiConfig,
+};
+use maki_lua::test_support::{
+    HintWriterHandle, RequestProbe, TestBinding, hint_writer_pair, keymap_reader_from,
+    probed_event_handle, set_mode,
+};
 use maki_lua::{
-    BuiltinAction, Dimension, FloatConfig, HintReader, KeymapReader, LuaCommandInfo,
-    LuaCommandReader, Missing, PackCommand, PackPlan, PackPreparation, PackReport, Permission,
-    PluginPermissions, SessionEndReason, Split, WinCommand, WinEvent,
+    BuiltinAction, Dimension, FloatConfig, HintEntry, HintReader, InputRequest, InputRulesReader,
+    InputSubmit, KeybindTicket, KeymapReader, LuaCommandInfo, LuaCommandReader, Missing, PASTE,
+    PackCommand, PackPlan, PackPreparation, PackReport, Permission, PluginHost, PluginPermissions,
+    SessionEndReason, Split, TextEdit, UiAction, WinCommand, WinEvent,
 };
 use maki_providers::{
     ContentBlock, Effort, Message, Model, RequestOptions, Role, THINKING_USAGE, ThinkingSupport,
@@ -40,15 +52,18 @@ use maki_providers::{
 use maki_storage::id::MakiId;
 use maki_storage::model::read_thinking;
 use maki_storage::sessions::{
-    SessionClaim, SessionMeta, StoredMode, StoredThinking, StoredTokenUsage, THINKING_ADAPTIVE,
-    ThinkingParseError,
+    SessionClaim, SessionMeta, StoredMode, StoredThinking, StoredTokenUsage, StoredWriters,
+    THINKING_ADAPTIVE, ThinkingParseError,
 };
 use maki_storage::trusted_folders::{CanonicalFolder, TrustedFolders};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
+use ratatui::buffer::Buffer;
 use ratatui::layout::{Position, Rect};
+use ratatui::style::{Modifier, Style};
 use std::env;
 use std::fs;
+use std::iter;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tempfile::TempDir;
@@ -92,6 +107,9 @@ const FIXED_ADAPTIVE_PROVIDER: &str = "xai";
 const MODEL_CHANGED_EVENT: &str = "ModelChanged";
 const INPUT_CHANGED_EVENT: &str = "InputChanged";
 const PLAN_READY_EVENT: &str = "PlanReady";
+const MODE_CHANGED_EVENT: &str = "ModeChanged";
+const NORMAL_MODE_TEXT: &str = "ab\\";
+const PASTED: &str = "pasted ";
 const PLAN_DRAFT_PATH: &str = "/tmp/plan.md";
 /// The draft of the session a tab switch loads, which is not the one the
 /// abandoned pick was made against.
@@ -186,6 +204,7 @@ fn build_app_with_session(
         lua_commands,
         KeymapReader::empty(),
         HintReader::empty(),
+        InputRulesReader::empty(),
         writer,
         UiConfig::default(),
         100,
@@ -573,9 +592,10 @@ fn a_notice_line_keeps_its_history_position(live: &[LiveStep], saved: &[SavedSte
     assert_eq!(shown, notice_and_prompt_rows(restored.iter()));
 }
 
+const TYPED_TEXT: &str = "hi";
+
 fn with_text(app: &mut App) {
-    app.update(Msg::Key(key(KeyCode::Char('h'))));
-    app.update(Msg::Key(key(KeyCode::Char('i'))));
+    type_keys(app, TYPED_TEXT);
 }
 
 fn with_image(app: &mut App) {
@@ -583,24 +603,94 @@ fn with_image(app: &mut App) {
     app.input_box.attach_image(img);
 }
 
-#[test_case(with_text as fn(&mut App)  ; "clears_text")]
-#[test_case(with_image as fn(&mut App) ; "clears_image")]
-fn ctrl_c_clears_nonempty_input(setup: fn(&mut App)) {
-    let mut app = test_app();
-    setup(&mut app);
-    let actions = app.update(Msg::Key(kb::QUIT.to_key_event()));
-    assert!(actions.is_empty());
-    assert_eq!(app.exit_request, ExitRequest::None);
-    assert!(app.input_box.is_empty());
+fn with_selection(app: &mut App) {
+    with_text(app);
+    app.update(Msg::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT)));
 }
 
-#[test]
-fn ctrl_c_quits_when_input_empty() {
+fn with_nothing(_: &mut App) {}
+
+/// What one `Ctrl+C` in the chat input left behind: the text and whether
+/// the input is empty, and whether it copied, cancelled the turn or quit.
+#[derive(Debug, PartialEq)]
+struct CtrlC {
+    left: String,
+    empty: bool,
+    copied: bool,
+    cancelled: bool,
+    quit: bool,
+}
+
+const CTRL_C_EMPTIED: CtrlC = CtrlC {
+    left: String::new(),
+    empty: true,
+    copied: false,
+    cancelled: false,
+    quit: false,
+};
+
+fn copied_keeping_the_text() -> CtrlC {
+    CtrlC {
+        left: TYPED_TEXT.into(),
+        empty: false,
+        copied: true,
+        ..CTRL_C_EMPTIED
+    }
+}
+
+/// Each press does the first thing that applies: copy a selection, clear
+/// the input, then cancel a running turn or, idle, quit.
+#[test_case(with_selection as fn(&mut App), Status::Idle      => copied_keeping_the_text() ; "selection_copies_and_keeps_the_text")]
+#[test_case(with_selection as fn(&mut App), Status::Streaming => copied_keeping_the_text() ; "selection_copies_while_streaming")]
+#[test_case(with_text as fn(&mut App),      Status::Idle      => CTRL_C_EMPTIED ; "text_clears_the_input")]
+#[test_case(with_image as fn(&mut App),     Status::Idle      => CTRL_C_EMPTIED ; "image_clears_the_input")]
+#[test_case(with_nothing as fn(&mut App),   Status::Idle      => CtrlC { quit: true, ..CTRL_C_EMPTIED } ; "empty_idle_quits")]
+#[test_case(with_nothing as fn(&mut App),   Status::Streaming => CtrlC { cancelled: true, ..CTRL_C_EMPTIED } ; "empty_streaming_cancels_the_turn")]
+fn ctrl_c_in_the_chat_input(setup: fn(&mut App), status: Status) -> CtrlC {
     let mut app = test_app();
-    app.status = Status::Idle;
+    app.clipboard = ClipboardState::terminal_only();
+    setup(&mut app);
+    app.status = status;
+    app.run_id = 1;
+    press_ctrl_c(&mut app)
+}
+
+fn press_ctrl_c(app: &mut App) -> CtrlC {
     let actions = app.update(Msg::Key(kb::QUIT.to_key_event()));
-    assert_eq!(app.exit_request, ExitRequest::Success);
-    assert!(matches!(actions.as_slice(), [Action::ManualExit]));
+    CtrlC {
+        left: app.input_box.buffer.value().to_owned(),
+        empty: app.input_box.is_empty(),
+        copied: app.status_bar.flash_text() == Some(FLASH_COPIED),
+        cancelled: matches!(actions.as_slice(), [Action::CancelAgent { .. }])
+            && app.status == Status::Idle,
+        quit: app.exit_request == ExitRequest::Success
+            && matches!(actions.as_slice(), [Action::ManualExit]),
+    }
+}
+
+/// A plugin that selects the text again after every change cannot keep
+/// `Ctrl+C` copying: the press right after a copy goes on to clear the input.
+/// Any other key in between lets the next press copy again.
+#[test_case(&[]                => CTRL_C_EMPTIED             ; "a_press_right_after_a_copy_clears")]
+#[test_case(&[KeyCode::Right] => copied_keeping_the_text() ; "a_key_in_between_copies_again")]
+fn ctrl_c_after_a_copy(between: &[KeyCode]) -> CtrlC {
+    let mut app = test_app();
+    app.clipboard = ClipboardState::terminal_only();
+    with_selection(&mut app);
+    app.update(Msg::Key(kb::QUIT.to_key_event()));
+    for code in between {
+        app.update(Msg::Key(key(*code)));
+    }
+    app.status_bar.clear_flash();
+    let end = app.input_box.buffer.value().len();
+    let reselect = InputEdit {
+        edits: vec![],
+        cursor: Some(end - 1),
+        anchor: Some(end),
+        ..planned_edit(&app, 0, 0, "")
+    };
+    apply_edit(&mut app, reselect).unwrap();
+    press_ctrl_c(&mut app)
 }
 
 #[test_case(done(), ExitRequest::Success ; "done_exits_success")]
@@ -712,21 +802,16 @@ fn altgr_chars_not_swallowed_by_ctrl_handler() {
     assert_eq!(app.input_box.buffer.value(), "hi\\");
 }
 
-#[test]
-fn undo_key_rewinds_the_last_paste_in_the_chat_input() {
+#[test_case(kb::UNDO.to_key_event()                                ; "alt_z")]
+#[test_case(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::SUPER) ; "super_z")]
+fn undo_key_rewinds_a_multi_line_paste_then_the_typing(undo: KeyEvent) {
     let mut app = test_app();
     app.update(Msg::Key(key(KeyCode::Char('h'))));
     app.update(Msg::Key(key(KeyCode::Char('i'))));
-    app.update(Msg::Paste("pasted\nacross\nlines".into()));
-    let alt_z = KeyEvent {
-        code: KeyCode::Char('z'),
-        modifiers: KeyModifiers::ALT,
-        kind: crossterm::event::KeyEventKind::Press,
-        state: crossterm::event::KeyEventState::NONE,
-    };
-    app.update(Msg::Key(alt_z));
+    app.update(Msg::Paste("one\ntwo\nthree".into()));
+    app.update(Msg::Key(undo));
     assert_eq!(app.input_box.buffer.value(), "hi");
-    app.update(Msg::Key(alt_z));
+    app.update(Msg::Key(undo));
     assert_eq!(app.input_box.buffer.value(), "");
 }
 
@@ -1006,8 +1091,7 @@ fn ctrl_c_closes_palette() {
 fn turn_start_carries_what_the_user_typed() {
     const TYPED: &str = "fix the parser";
     let mut app = test_app();
-    let (handle, probe) = maki_lua::test_support::probed_event_handle();
-    app.lua_event_handle = handle;
+    let probe = probe_events(&mut app);
 
     app.start_from_queue(&queued_msg(TYPED));
 
@@ -1021,8 +1105,7 @@ fn turn_start_carries_what_the_user_typed() {
 #[test]
 fn session_reset_names_the_session_that_ended() {
     let mut app = test_app();
-    let (handle, probe) = maki_lua::test_support::probed_event_handle();
-    app.lua_event_handle = handle;
+    let probe = probe_events(&mut app);
     let ended = app.state.session.id.to_string();
 
     app.reset_session();
@@ -1083,7 +1166,7 @@ fn blank_session_carries_the_settings_that_outlive_a_turn() {
     app.state.mode = Mode::Plan;
     app.state.plan = PlanState::Ready(PathBuf::from("plan.md"));
     app.state.context_size = MEASURED_CONTEXT;
-    app.input_box.set_input("half a thought".into());
+    app.input_box.set_input("half a thought");
     app.queue_and_notify(queued_msg("q"));
     app.permissions.load_session_rules(vec![session_rule()]);
     app.permissions.set_session_yolo(Some(true));
@@ -1294,8 +1377,7 @@ fn reset_session_clears_drafting_plan_in_build_mode() {
 #[test]
 fn plan_ready_fires_once_per_draft() {
     let mut app = test_app();
-    let (handle, probe) = maki_lua::test_support::probed_event_handle();
-    app.lua_event_handle = handle;
+    let probe = probe_events(&mut app);
 
     app.state.mode = Mode::Plan;
     app.state.plan = PlanState::Drafting(PathBuf::from(PLAN_DRAFT_PATH));
@@ -1314,8 +1396,7 @@ fn plan_ready_fires_once_per_draft() {
 #[test]
 fn plan_ready_does_not_fire_outside_plan_mode() {
     let mut app = test_app();
-    let (handle, probe) = maki_lua::test_support::probed_event_handle();
-    app.lua_event_handle = handle;
+    let probe = probe_events(&mut app);
 
     app.state.mode = Mode::Build;
     app.state.plan = PlanState::Drafting(PathBuf::from(PLAN_DRAFT_PATH));
@@ -1331,7 +1412,7 @@ fn plan_ready_does_not_fire_outside_plan_mode() {
 fn an_unlayered_plan_form_opens_without_asking(hosted: bool) {
     let mut app = test_app();
     let _probe = hosted.then(|| {
-        let (handle, probe) = maki_lua::test_support::probed_event_handle();
+        let (handle, probe) = probed_event_handle();
         app.lua_event_handle = handle;
         probe
     });
@@ -1869,8 +1950,7 @@ fn load_session_clears_plan() {
 #[test]
 fn tool_lifecycle_events_name_the_session_and_tool() {
     let mut app = streaming_app();
-    let (handle, probe) = maki_lua::test_support::probed_event_handle();
-    app.lua_event_handle = handle;
+    let probe = probe_events(&mut app);
     let session_id = app.state.session.id.to_string();
 
     app.update(agent_msg(tool_start("tool-1", "bash")));
@@ -2971,18 +3051,6 @@ fn double_esc_idle_no_user_turns_flashes_error() {
     assert!(!app.rewind_picker.is_open());
 }
 
-#[test]
-fn ctrl_c_while_streaming_cancels_instead_of_quitting() {
-    let mut app = test_app();
-    app.status = Status::Streaming;
-    app.run_id = 1;
-
-    let actions = app.update(Msg::Key(kb::QUIT.to_key_event()));
-    assert!(matches!(&actions[0], Action::CancelAgent { .. }));
-    assert_eq!(app.status, Status::Idle);
-    assert_ne!(app.exit_request, ExitRequest::Success);
-}
-
 /// The whole point of issue 778: a settled session paints nothing at all. Any
 /// poller that starts reporting a change on every tick trips this.
 #[test]
@@ -3068,10 +3136,7 @@ fn tick_drains_live_bufs_of_background_chats() {
 #[test]
 fn status_hints_published_by_a_plugin_reach_the_screen() {
     let (mut app, plugin) = app_with_hints();
-    plugin.publish(vec![(
-        Arc::from(HINT_PLUGIN),
-        vec![(HINT_TEXT.into(), HINT_STYLE.into())],
-    )]);
+    plugin.publish(vec![hint_for(None)]);
 
     assert!(
         !rendered(&mut app).contains(HINT_TEXT),
@@ -3085,15 +3150,168 @@ fn status_hints_published_by_a_plugin_reach_the_screen() {
     assert!(!rendered(&mut app).contains(HINT_TEXT));
 }
 
-fn rendered(app: &mut App) -> String {
-    let backend = ratatui::backend::TestBackend::new(80, 24);
-    let mut terminal = ratatui::Terminal::new(backend).unwrap();
-    terminal
-        .draw(|frame| {
-            app.view(frame);
+fn hint_for(session: Option<MakiId>) -> HintEntry {
+    HintEntry {
+        plugin: Arc::from(HINT_PLUGIN),
+        session,
+        spans: vec![(HINT_TEXT.into(), HINT_STYLE.into())],
+    }
+}
+
+#[test_case(true ; "own_session")]
+#[test_case(false ; "other_session")]
+fn session_hint_shows_only_in_its_tab(own: bool) {
+    let (mut app, plugin) = app_with_hints();
+    let owner = if own {
+        app.state.session.id
+    } else {
+        MakiId::generate()
+    };
+    plugin.publish(vec![hint_for(Some(owner))]);
+
+    let _ = app.tick();
+
+    assert_eq!(rendered(&mut app).contains(HINT_TEXT), own);
+}
+
+const RENDERED_WIDTH: u16 = 80;
+const RENDERED_HEIGHT: u16 = 24;
+const CHIP_PLUGIN_NAME: &str = "chips";
+const CHIP_PLUGIN: &str = r#"
+maki.ui.input_rules({
+  ns = "skill",
+  pattern = [[\$skill:([\w-]+)]],
+  mark = { conceal = "[$1]", atomic = true },
+})
+"#;
+const CHIP_PROMPT: &str = "use $skill:go now";
+const CHIP_SOURCE: &str = "$skill:go";
+const CHIP_DRAWN: &str = "use [go] now";
+const CHIP_TAIL: &str = " now";
+
+/// The rule goes from the Lua thread to the screen with no frame asked for,
+/// so only `tick` can pick it up, and the same goes for its removal.
+#[test]
+fn a_plugin_rule_draws_a_chip_until_the_plugin_unloads() {
+    let host = new_host();
+    host.load_source(CHIP_PLUGIN_NAME, CHIP_PLUGIN).unwrap();
+    let mut app = test_app();
+    app.input_rules_reader = host.input_rules_reader();
+    assert_eq!(app.tick(), Dirty::YES, "{OWED}");
+
+    type_keys(&mut app, CHIP_PROMPT);
+    assert!(rendered(&mut app).contains(CHIP_DRAWN));
+
+    for _ in 0..=CHIP_TAIL.len() {
+        app.update(Msg::Key(key(KeyCode::Left)));
+    }
+    let chip_start = CHIP_PROMPT.find(CHIP_SOURCE).unwrap();
+    assert_eq!(app.input_box.buffer.cursor_byte(), chip_start);
+    app.update(Msg::Key(key(KeyCode::Right)));
+    assert_eq!(
+        app.input_box.buffer.cursor_byte(),
+        chip_start + CHIP_SOURCE.len()
+    );
+
+    host.unload(CHIP_PLUGIN_NAME).unwrap();
+    assert_eq!(app.tick(), Dirty::YES, "{OWED}");
+    assert!(rendered(&mut app).contains(CHIP_SOURCE));
+}
+
+const PREVIEW_PLUGIN_NAME: &str = "preview";
+const PREVIEW_PLUGIN: &str = r#"
+maki.ui.input_rules({
+  ns = "md",
+  treesitter = {
+    lang = "markdown",
+    query = {
+      markdown = [[
+        (atx_heading (atx_h1_marker) @hidden) @heading
+        (fenced_code_block (fenced_code_block_delimiter) @fence)
+        (fenced_code_block
+          (info_string (language) @injection.language)
+          (code_fence_content) @injection.content)
+      ]],
+      markdown_inline = [[
+        (strong_emphasis (emphasis_delimiter) @hidden) @strong
+        (emphasis (emphasis_delimiter) @hidden) @em
+        (code_span (code_span_delimiter) @hidden) @code
+      ]],
+    },
+    captures = {
+      hidden = { conceal = "", reveal = "cursor" },
+      heading = { hl = { underline = true } },
+      strong = { hl = { bold = true } },
+      em = { hl = { italic = true } },
+      code = { hl = { reversed = true } },
+      fence = { hl = { dim = true } },
+    },
+  },
+})
+"#;
+const PREVIEW_PROMPT: &str =
+    "# Title\nsay **hi** to *you* and `snippet`\n```rust\nfn main() {}\n```";
+const PREVIEW_RAW: &str = "say **hi** to *you* and `snippet`";
+const PREVIEW_DRAWN: &str = "say hi to you and snippet";
+
+/// The style of the first cell of {needle} on the screen.
+fn style_of(buffer: &Buffer, needle: &str) -> Style {
+    let area = buffer.area;
+    let (col, row) = (0..area.height)
+        .find_map(|row| {
+            let line: String = (0..area.width)
+                .map(|col| buffer[(col, row)].symbol())
+                .collect();
+            let at = line.find(needle)?;
+            Some((line[..at].chars().count() as u16, row))
         })
+        .unwrap_or_else(|| panic!("{needle:?} is not on the screen"));
+    buffer[(col, row)].style()
+}
+
+/// Bold, italic, a heading, a code span and fenced code, all from one Lua
+/// rule. The tick after the paste can only hand the parse to the worker,
+/// which runs when the test says so. A raw frame after that tick shows the
+/// UI thread never parsed, and the size of the paste does not change that.
+#[test]
+fn a_markdown_preview_plugin_draws_the_prompt_once_parsed() {
+    crate::highlight::warmup();
+    decor_worker::manual();
+    let host = new_host();
+    host.load_source(PREVIEW_PLUGIN_NAME, PREVIEW_PLUGIN)
         .unwrap();
-    buffer_text(terminal.backend().buffer())
+    let mut app = test_app();
+    app.input_rules_reader = host.input_rules_reader();
+    let _ = app.tick();
+    while decor_worker::run_queued() > 0 {
+        let _ = app.tick();
+    }
+
+    app.update(Msg::Paste(PREVIEW_PROMPT.into()));
+    let _ = app.tick();
+    assert!(rendered(&mut app).contains(PREVIEW_RAW));
+    assert_eq!(decor_worker::run_queued(), 1);
+    assert_eq!(app.tick(), Dirty::YES, "{OWED}");
+
+    let screen = rendered_buffer(&mut app);
+    let text = buffer_text(&screen);
+    assert!(text.contains(PREVIEW_DRAWN), "{text}");
+    assert!(!text.contains("# Title"), "{text}");
+    let modifiers = |needle| style_of(&screen, needle).add_modifier;
+    assert!(modifiers("Title").contains(Modifier::UNDERLINED));
+    assert!(modifiers("hi to").contains(Modifier::BOLD));
+    assert!(modifiers("you and").contains(Modifier::ITALIC));
+    assert!(modifiers("snippet").contains(Modifier::REVERSED));
+    assert!(modifiers("```rust").contains(Modifier::DIM));
+    assert_ne!(style_of(&screen, "fn main").fg, style_of(&screen, "say").fg);
+}
+
+fn rendered_buffer(app: &mut App) -> Buffer {
+    draw_sized(app, RENDERED_WIDTH, RENDERED_HEIGHT).1
+}
+
+fn rendered(app: &mut App) -> String {
+    buffer_text(&rendered_buffer(app))
 }
 
 /// The event loop parks the terminal cursor on whatever `view` reports, so an
@@ -3159,11 +3377,7 @@ fn open_caret_float(app: &mut App) {
     app.float_mgr.open(buf, config, true, event_tx, cmd_rx);
 }
 
-fn draw_sized(
-    app: &mut App,
-    width: u16,
-    height: u16,
-) -> (Option<Position>, ratatui::buffer::Buffer) {
+fn draw_sized(app: &mut App, width: u16, height: u16) -> (Option<Position>, Buffer) {
     let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend).unwrap();
     let mut cursor = None;
@@ -3171,7 +3385,7 @@ fn draw_sized(
     (cursor, terminal.backend().buffer().clone())
 }
 
-fn draw_to_buffer(app: &mut App) -> (Option<Position>, ratatui::buffer::Buffer) {
+fn draw_to_buffer(app: &mut App) -> (Option<Position>, Buffer) {
     draw_sized(app, TEST_AREA.width, TEST_AREA.height)
 }
 
@@ -3234,7 +3448,7 @@ fn a_caret_anchored_float_falls_back_when_the_input_box_is_off_screen() {
 #[test]
 fn input_snapshot_offsets_are_byte_offsets() {
     let mut app = test_app();
-    app.input_box.set_input("日本".into());
+    app.input_box.set_input("日本");
     app.input_box.buffer.move_to_end();
 
     let st = app.input_snapshot();
@@ -3251,7 +3465,7 @@ fn input_snapshot_offsets_are_byte_offsets() {
 fn input_snapshot_carries_nothing_a_slice_would_give() {
     const DRAFT: &str = "first\nsecond";
     let mut app = test_app();
-    app.input_box.set_input(DRAFT.into());
+    app.input_box.set_input(DRAFT);
     app.input_box.buffer.move_to_end();
 
     assert_eq!(
@@ -3260,6 +3474,7 @@ fn input_snapshot_carries_nothing_a_slice_would_give() {
             "session_id": app.state.session.id.to_string(),
             "text": DRAFT,
             "cursor": DRAFT.len(),
+            "anchor": null,
             "version": app.input_box.buffer.version(),
         })
     );
@@ -3268,15 +3483,24 @@ fn input_snapshot_carries_nothing_a_slice_would_give() {
 /// The edit a plugin plans right after reading, both guards naming the value
 /// it read. Tests spoil one guard at a time from here.
 fn planned_edit(app: &App, start: usize, stop: usize, text: &str) -> InputEdit {
-    let st = app.input_snapshot();
+    edit_planned_on(&app.input_snapshot(), start, stop, text)
+}
+
+/// Plans against {st}, an input snapshot as a handler is handed it.
+fn edit_planned_on(st: &serde_json::Value, start: usize, stop: usize, text: &str) -> InputEdit {
     InputEdit {
-        start,
-        stop,
-        text: text.into(),
+        edits: vec![TextEdit {
+            start,
+            stop,
+            text: text.into(),
+        }],
         version: st["version"].as_u64().unwrap(),
         session_id: st["session_id"].as_str().unwrap().into(),
-        plugin: Arc::from(EDIT_PLUGIN),
-        ..InputEdit::default()
+        caller: trusted().owned_by(Arc::from(EDIT_PLUGIN)),
+        cursor: None,
+        anchor: None,
+        strict: false,
+        marks: None,
     }
 }
 
@@ -3287,25 +3511,60 @@ fn apply_edit(app: &mut App, edit: InputEdit) -> Result<serde_json::Value, Strin
     app.apply_input_edit(edit, TEST_AREA)
 }
 
-/// The bounds check alone passes an edit the user has typed in front of: a
-/// plugin reads "hello" and plans to replace 0..5, the user presses home and
-/// types "x", and 5 still fits "xhello". Only the version catches it.
+/// Typing elsewhere is the common race, and refusing it would make a plugin
+/// lose to every keystroke. The plugin cannot work out the new version or
+/// cursor from the text it read, so the answer hands both back.
 #[test]
-fn an_input_edit_planned_against_an_older_value_fails_on_the_version() {
+fn a_stale_input_edit_lands_past_typing_elsewhere() {
+    const FIXED: &str = "please fix src/main.rs";
     let mut app = test_app();
-    app.input_box.set_input("hello".into());
-    let planned = planned_edit(&app, 0, 5, "bye");
+    app.input_box.set_input("fix @src");
+    let planned = planned_edit(&app, 4, 8, "src/main.rs");
 
-    app.input_box.buffer.set_cursor_byte(0).unwrap();
-    app.input_box.buffer.push_char('x');
+    app.input_box.buffer.set_cursor(0, 0);
+    app.input_box.buffer.insert_text("please ");
 
-    let err = apply_edit(&mut app, planned).unwrap_err();
-    assert!(err.contains("version"), "the error has to name why: {err}");
-    assert_eq!(app.input_box.buffer.value(), "xhello");
+    let answer = apply_edit(&mut app, planned).unwrap();
+    assert_eq!(app.input_box.buffer.value(), FIXED);
+    assert_eq!(
+        answer,
+        serde_json::json!({
+            "version": app.input_box.buffer.version(),
+            "cursor": FIXED.len(),
+        })
+    );
+}
 
-    let fresh = planned_edit(&app, 0, 6, "bye");
-    assert!(apply_edit(&mut app, fresh).is_ok());
-    assert_eq!(app.input_box.buffer.value(), "bye");
+/// Reading again and retrying is what the docs tell a plugin to do after any
+/// refusal, so the retry has to land. For `strict` that is also the proof it
+/// still takes the current version.
+#[test_case(false, |input| { input.buffer.set_cursor(0, 0); input.buffer.push_char('x') }, EDIT_CONFLICT_ERR ; "typed_where_the_edit_lands")]
+#[test_case(false, |input| { input.history_up(); },                                         INPUT_REPLACED_ERR ; "history_recall")]
+#[test_case(true,  |input| { input.buffer.move_to_end(); input.buffer.push_char('!') },    STALE_VERSION_ERR  ; "strict_after_typing_elsewhere")]
+fn a_refused_input_edit_lands_once_read_again(strict: bool, user: fn(&mut InputBox), err: &str) {
+    // Recalling this logs a diff far from the edit, since it shares its start
+    // with the prompt. The offsets still point into another prompt.
+    const RECALLED: &str = "hello world, again";
+    let mut app = test_app();
+    app.input_box.set_input(RECALLED);
+    let _ = app.input_box.submit();
+    app.input_box.set_input("hello world");
+    let plan = |app: &App| InputEdit {
+        strict,
+        ..planned_edit(app, 0, 0, "> ")
+    };
+    let planned = plan(&app);
+
+    user(&mut app.input_box);
+    let seen = app.input_box.buffer.value().to_owned();
+
+    let refused = apply_edit(&mut app, planned).unwrap_err();
+    assert!(refused.starts_with(err), "{refused}");
+    assert_eq!(app.input_box.buffer.value(), seen);
+
+    let retry = plan(&app);
+    apply_edit(&mut app, retry).unwrap();
+    assert_eq!(app.input_box.buffer.value(), format!("> {seen}"));
 }
 
 /// Focus can move between the read and the write, and the version cannot tell
@@ -3314,7 +3573,7 @@ fn an_input_edit_planned_against_an_older_value_fails_on_the_version() {
 #[test]
 fn an_input_edit_naming_another_session_is_refused() {
     let mut app = test_app();
-    app.input_box.set_input("hello".into());
+    app.input_box.set_input("hello");
 
     let stale = InputEdit {
         session_id: OTHER_SESSION_ID.into(),
@@ -3334,7 +3593,7 @@ fn an_input_edit_naming_another_session_is_refused() {
 #[test]
 fn an_input_edit_is_refused_while_the_input_is_off_screen() {
     let mut app = test_app();
-    app.input_box.set_input("hello".into());
+    app.input_box.set_input("hello");
     open_split_window(&mut app, Split::Below);
 
     let planned = planned_edit(&app, 0, 5, "bye");
@@ -3355,7 +3614,7 @@ fn an_input_edit_is_refused_while_the_input_is_off_screen() {
 #[test]
 fn an_input_edit_meets_a_prompt_opened_since_the_last_frame() {
     let mut app = test_app();
-    app.input_box.set_input("hello".into());
+    app.input_box.set_input("hello");
     draw_to_buffer(&mut app);
 
     app.permission_prompt.push(
@@ -3378,7 +3637,7 @@ fn an_input_edit_meets_a_prompt_opened_since_the_last_frame() {
 #[test]
 fn an_input_edit_is_refused_while_an_overlay_is_up() {
     let mut app = test_app();
-    app.input_box.set_input("hello".into());
+    app.input_box.set_input("hello");
 
     let tmp = TempDir::new().unwrap();
     app.file_picker.open(&tmp.path().to_string_lossy());
@@ -3399,7 +3658,7 @@ fn an_input_edit_is_refused_while_an_overlay_is_up() {
 fn an_input_edit_is_refused_when_the_terminal_cannot_fit_the_input_box() {
     const TOO_SHORT: u16 = MIN_CHAT_ROWS + 1;
     let mut app = test_app();
-    app.input_box.set_input("hello".into());
+    app.input_box.set_input("hello");
     let cramped = Rect::new(0, 0, TEST_AREA.width, TOO_SHORT);
 
     let planned = planned_edit(&app, 0, 5, "bye");
@@ -3421,7 +3680,7 @@ fn editor_text_keeps_its_tabs() {
 	println!();
 }";
     let mut app = test_app();
-    app.input_box.set_input(EDITED.into());
+    app.input_box.set_input(EDITED);
     assert_eq!(app.input_snapshot()["text"], serde_json::json!(EDITED));
 }
 
@@ -4311,8 +4570,7 @@ fn cd_command_behavior() {
 #[test]
 fn cd_fires_cwd_changed_with_the_new_directory() {
     let mut app = test_app();
-    let (handle, probe) = maki_lua::test_support::probed_event_handle();
-    app.lua_event_handle = handle;
+    let probe = probe_events(&mut app);
 
     app.execute_command(
         ParsedCommand {
@@ -4336,8 +4594,7 @@ fn cd_fires_cwd_changed_with_the_new_directory() {
 #[test]
 fn failed_cd_fires_no_cwd_changed() {
     let mut app = test_app();
-    let (handle, probe) = maki_lua::test_support::probed_event_handle();
-    app.lua_event_handle = handle;
+    let probe = probe_events(&mut app);
 
     app.execute_command(
         ParsedCommand {
@@ -4404,8 +4661,7 @@ fn typed_lua_command_with_args_executes() {
             max_args: usize::MAX,
         }]),
     );
-    let (handle, probe) = maki_lua::test_support::probed_event_handle();
-    app.lua_event_handle = handle;
+    let probe = probe_events(&mut app);
 
     let actions = type_and_submit(&mut app, "/rename my title");
 
@@ -4447,7 +4703,7 @@ fn run_cmdline_splits_args_off_the_name() {
 #[test]
 fn run_cmdline_keeps_typed_input() {
     let mut app = test_app();
-    app.input_box.set_input("half written".into());
+    app.input_box.set_input("half written");
 
     app.run_cmdline("/usage", 0, &trusted()).unwrap();
 
@@ -4457,8 +4713,7 @@ fn run_cmdline_keeps_typed_input() {
 #[test]
 fn run_cmdline_unknown_name_errors_without_dispatching() {
     let mut app = test_app();
-    let (handle, probe) = maki_lua::test_support::probed_event_handle();
-    app.lua_event_handle = handle;
+    let probe = probe_events(&mut app);
 
     let Err(err) = app.run_cmdline("/nope", 0, &trusted()) else {
         panic!("{RUN_CMDLINE_REJECTED}");
@@ -4537,7 +4792,7 @@ fn run_cmdline_needs_what_the_command_reaches(cmdline: &str, needed: &[Permissio
     for &permission in needed {
         assert_eq!(
             app.run_cmdline(cmdline, 1, &without(permission)).err(),
-            Some(missing_refusal(command, &Missing::Permission(permission)))
+            Some(Missing::Permission(permission).refusal(command))
         );
     }
     assert_eq!(app.run_cmdline(cmdline, 1, &only_these(needed)).err(), None);
@@ -4558,7 +4813,7 @@ fn run_cmdline_refuses_session_commands_without_their_permission(
     held: Permission,
 ) {
     let mut app = test_app();
-    let refusal = Some(missing_refusal(cmdline, &Missing::Permission(needed)));
+    let refusal = Some(Missing::Permission(needed).refusal(cmdline));
 
     assert_eq!(app.run_cmdline(cmdline, 1, &without(needed)).err(), refusal);
     assert_eq!(app.run_cmdline(cmdline, 1, &only(held)).err(), refusal);
@@ -4596,8 +4851,7 @@ fn run_cmdline_forwards_depth_to_lua_command() {
             max_args: 0,
         }]),
     );
-    let (handle, probe) = maki_lua::test_support::probed_event_handle();
-    app.lua_event_handle = handle;
+    let probe = probe_events(&mut app);
 
     app.run_cmdline("/sessions", 3, &trusted()).unwrap();
 
@@ -4653,10 +4907,14 @@ fn seed_rewind_session(session: &mut AppSession) {
 const RESTART_EXPECTED: &str = "a rewind must respawn the agent on the truncated history";
 
 fn rewind_to_second_turn() -> RewindEntry {
+    rewind_to_prompt("second prompt")
+}
+
+fn rewind_to_prompt(text: &str) -> RewindEntry {
     RewindEntry {
         turn_index: 2,
         prompt_preview: "2: second".into(),
-        prompt_text: "second prompt".into(),
+        prompt_text: text.into(),
     }
 }
 
@@ -5698,22 +5956,2344 @@ fn ctrl_t_noop_when_plan_not_ready() {
     assert!(!app.plan_form.is_visible());
 }
 
-/// The plugin-boundary identity of a press a test names by code, which is how
-/// the host sees it once [`maki_lua::Key::from_event`] has normalized it.
-fn plugin_key(code: KeyCode, modifiers: KeyModifiers) -> maki_lua::Key {
-    maki_lua::Key::from_event(KeyEvent::new(code, modifiers)).expect(EXPECT_NAMEABLE)
-}
-
-fn install_override(
-    app: &mut App,
-    key: KeyCode,
-    modifiers: KeyModifiers,
-) -> maki_lua::test_support::RequestProbe {
-    app.keymap_reader =
-        maki_lua::test_support::keymap_reader_with(vec![plugin_key(key, modifiers)]);
-    let (handle, probe) = maki_lua::test_support::probed_event_handle();
+fn probe_events(app: &mut App) -> RequestProbe {
+    let (handle, probe) = probed_event_handle();
     app.lua_event_handle = handle;
     probe
+}
+
+/// The plugin-boundary identity of a press a test names by code, which is how
+/// the host sees it once [`Key::from_event`] has normalized it.
+fn plugin_key(code: KeyCode, modifiers: KeyModifiers) -> Key {
+    Key::from_event(KeyEvent::new(code, modifiers)).expect(EXPECT_NAMEABLE)
+}
+
+const EVERY_MODE: &[InputMode] = &[InputMode::Normal, InputMode::Insert];
+const INSERT: &[InputMode] = &[InputMode::Insert];
+const NORMAL: &[InputMode] = &[InputMode::Normal];
+
+/// Who binds the key, in which modes, and for which buffer. `None` is global.
+type Bind<'a> = (&'a str, &'a [InputMode], Option<&'a Arc<SharedBuf>>);
+
+fn bind_all(app: &mut App, key: Key, binds: &[Bind]) -> RequestProbe {
+    let binds: Vec<TestBinding> = binds
+        .iter()
+        .map(|&(plugin, modes, buffer)| TestBinding {
+            plugin,
+            modes,
+            key,
+            buffer,
+        })
+        .collect();
+    app.keymap_reader = keymap_reader_from(&binds);
+    probe_events(app)
+}
+
+fn install_binding(app: &mut App, modes: &[InputMode], key: Key) -> RequestProbe {
+    bind_all(app, key, &[(GLOBAL_PLUGIN, modes, None)])
+}
+
+fn install_override(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> RequestProbe {
+    install_binding(app, EVERY_MODE, plugin_key(code, modifiers))
+}
+
+/// A vim plugin binds plain letters in normal mode. If those fired while
+/// typing, nobody could type a `j` anymore.
+#[test]
+fn a_normal_binding_rests_while_typing_and_fires_in_normal_mode() {
+    let mut app = test_app();
+    let probe = install_binding(
+        &mut app,
+        NORMAL,
+        plugin_key(KeyCode::Char('j'), KeyModifiers::NONE),
+    );
+
+    app.update(Msg::Key(key(KeyCode::Char('j'))));
+    assert!(
+        probe.try_recv_keybind().is_none(),
+        "{OVERRIDE_NOT_DISPATCHED}"
+    );
+    assert_eq!(app.input_box.buffer.value(), "j");
+
+    set_mode(&app.keymap_reader, InputMode::Normal);
+    app.update(Msg::Key(key(KeyCode::Char('j'))));
+    assert!(probe.try_recv_keybind().is_some(), "{OVERRIDE_DISPATCHED}");
+    assert_eq!(app.input_box.buffer.value(), "j");
+}
+
+fn type_keys(app: &mut App, text: &str) {
+    for c in text.chars() {
+        app.update(Msg::Key(key(KeyCode::Char(c))));
+    }
+}
+
+/// Typed key by key, so the undo keys have something to take back.
+fn app_in_normal_mode(text: &str) -> App {
+    let mut app = test_app();
+    type_keys(&mut app, text);
+    set_mode(&app.keymap_reader, InputMode::Normal);
+    app
+}
+
+/// Normal mode belongs to a vim plugin. A key it leaves unbound has to land
+/// nowhere, not in the text.
+#[test_case(key(KeyCode::Char('x'))                                   ; "typing")]
+#[test_case(key(KeyCode::Backspace)                                   ; "backspace")]
+#[test_case(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL)  ; "ctrl_w")]
+#[test_case(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)        ; "shift_enter")]
+#[test_case(kb::UNDO.to_key_event()                                   ; "alt_z")]
+#[test_case(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::SUPER)    ; "cmd_z")]
+fn normal_mode_never_edits(edit: KeyEvent) {
+    let mut app = app_in_normal_mode(NORMAL_MODE_TEXT);
+    app.update(Msg::Key(edit));
+    assert_eq!(app.input_box.buffer.value(), NORMAL_MODE_TEXT);
+}
+
+/// The text ends in `\`, which would make `Enter` start a new line while
+/// typing. In normal mode nothing types, so `Enter` sends.
+#[test]
+fn normal_mode_still_moves_pastes_and_sends() {
+    let mut app = app_in_normal_mode(NORMAL_MODE_TEXT);
+
+    app.update(Msg::Key(key(KeyCode::Home)));
+    assert_eq!(app.input_box.buffer.cursor_byte(), 0);
+    app.update(Msg::Paste(PASTED.into()));
+    assert_eq!(
+        app.input_box.buffer.value(),
+        format!("{PASTED}{NORMAL_MODE_TEXT}")
+    );
+    app.update(Msg::Key(key(KeyCode::End)));
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    assert!(app.input_box.buffer.is_empty(), "Enter sends");
+}
+
+/// Every `ModeChanged` the event loop would fire now, as `[old, new]`.
+fn mode_changes(app: &App, announced: &mut InputMode, probe: &RequestProbe) -> Vec<[String; 2]> {
+    app.announce_mode(announced);
+    iter::from_fn(|| probe.try_recv_autocmd())
+        .filter(|(event, _)| event == MODE_CHANGED_EVENT)
+        .map(|(_, data)| ["old_mode", "new_mode"].map(|f| data[f].as_str().unwrap().to_owned()))
+        .collect()
+}
+
+/// A mode indicator is drawn from `ModeChanged` alone, so it has to fire when
+/// a plugin switches, when a modal takes the keyboard and when it gives it
+/// back. A switch the user cannot see, like a plugin going back to insert
+/// mode under an open modal, stays quiet.
+#[test]
+fn mode_changed_fires_on_real_changes_only() {
+    let mut app = test_app();
+    let probe = probe_events(&mut app);
+    let mut announced = InputMode::Insert;
+    let mut changes = |app: &App| mode_changes(app, &mut announced, &probe);
+    let (n, i) = (InputMode::Normal.letter(), InputMode::Insert.letter());
+
+    set_mode(&app.keymap_reader, InputMode::Normal);
+    assert_eq!(changes(&app), [[i, n]], "a plugin switched");
+    app.run_builtin(BuiltinAction::Help);
+    assert!(changes(&app).is_empty(), "already normal");
+    set_mode(&app.keymap_reader, InputMode::Insert);
+    assert!(changes(&app).is_empty(), "the modal still has the keyboard");
+    app.run_builtin(BuiltinAction::Help);
+    assert_eq!(changes(&app), [[n, i]], "the modal gave the keyboard back");
+    app.run_builtin(BuiltinAction::Help);
+    assert_eq!(changes(&app), [[i, n]], "a modal took the keyboard");
+}
+
+/// An app where a plugin binds {code} in insert mode.
+fn app_binding(code: KeyCode) -> (App, RequestProbe) {
+    let mut app = test_app();
+    let probe = install_binding(&mut app, INSERT, plugin_key(code, KeyModifiers::NONE));
+    (app, probe)
+}
+
+/// Presses the bound {code} and takes the ticket the Lua thread would run,
+/// so the test can play the handler and report it done.
+fn press_bound(app: &mut App, probe: &RequestProbe, code: KeyCode) -> KeybindTicket {
+    app.update(Msg::Key(key(code)));
+    probe.try_recv_ticket().expect(OVERRIDE_DISPATCHED)
+}
+
+/// The `dd` typed right after a vim `<Esc>` has to wait for the switch to
+/// normal mode, or it lands in the text as two letters.
+#[test]
+fn keys_typed_behind_a_mode_switch_land_in_the_new_mode() {
+    let (mut app, probe) = app_binding(KeyCode::Esc);
+
+    let esc = press_bound(&mut app, &probe, KeyCode::Esc);
+    type_keys(&mut app, "dd");
+    set_mode(&app.keymap_reader, InputMode::Normal);
+    app.keybind_done(esc.id());
+
+    assert_eq!(app.input_box.buffer.value(), "");
+}
+
+const COMPLETED_WORD: &str = "@src/ma";
+const COMPLETION: &str = "@src/main.rs";
+
+/// The accept is planned against the input at the press. If the `x` typed
+/// right after it went in first, the input version would move on and the
+/// accept would be refused.
+#[test]
+fn a_completion_tab_lands_before_the_key_typed_after_it() {
+    let (mut app, probe) = app_binding(KeyCode::Tab);
+    type_keys(&mut app, COMPLETED_WORD);
+
+    let mut tab = press_bound(&mut app, &probe, KeyCode::Tab);
+    type_keys(&mut app, "x");
+    let seen = serde_json::json!(tab.take_input().expect("the ticket carries the input"));
+    let accept = edit_planned_on(&seen, 0, COMPLETED_WORD.len(), COMPLETION);
+    apply_edit(&mut app, accept).expect("nothing was typed over the word");
+    app.keybind_done(tab.id());
+
+    assert_eq!(app.input_box.buffer.value(), format!("{COMPLETION}x"));
+}
+
+/// A handler that opens a picker may not return until the user closes it,
+/// so the held keys have to follow the keyboard there.
+#[test]
+fn held_keys_follow_the_keyboard_to_a_picker() {
+    let (mut app, probe) = app_binding(KeyCode::Tab);
+
+    press_bound(&mut app, &probe, KeyCode::Tab);
+    app.run_builtin(BuiltinAction::FilePicker);
+    app.update(Msg::Key(key(KeyCode::Esc)));
+    let _ = app.tick();
+
+    assert!(
+        !app.file_picker.is_open(),
+        "the held Esc reached the picker"
+    );
+    assert_ne!(app.status_bar.flash_text(), Some(HELD_KEYS_DROPPED));
+}
+
+/// A modal answers on a single key, so the held keys typed before it opened
+/// must not reach it, whether something else or the handler opened it.
+#[test_case(open_alert as fn(&mut App) ; "an_alert")]
+#[test_case(open_help                  ; "help_the_handler_opened")]
+fn held_keys_never_reach_a_modal_that_opened_while_they_waited(open: fn(&mut App)) {
+    let (mut app, probe) = app_binding(KeyCode::Tab);
+
+    let tab = press_bound(&mut app, &probe, KeyCode::Tab);
+    app.update(Msg::Key(key(KeyCode::Esc)));
+    open(&mut app);
+    app.keybind_done(tab.id());
+
+    assert!(app.has_modal_overlay(), "the held Esc closed the modal");
+    assert_eq!(app.status_bar.flash_text(), Some(HELD_KEYS_DROPPED));
+}
+
+/// An Enter that met an input changed under it: nothing sent, the input
+/// left as {left}, and a flash saying to press Enter again.
+fn assert_unsent(app: &App, actions: &[Action], left: &str) {
+    assert!(actions.is_empty());
+    assert_eq!(app.status_bar.flash_text(), Some(INPUT_CHANGED_UNSENT));
+    assert_eq!(app.input_box.buffer.value(), left);
+}
+
+/// Streams a turn on {app}, and returns where its answers to the agent go.
+fn answer_channel(app: &mut App) -> flume::Receiver<String> {
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    let (answer_tx, answer_rx) = flume::unbounded();
+    app.answer_tx = Some(answer_tx);
+    answer_rx
+}
+
+fn ask_permission(app: &mut App) {
+    app.update(agent_msg(AgentEvent::PermissionRequest {
+        id: FIRST_ASK.into(),
+        tool: ToolKey::native("bash"),
+        scopes: vec!["ls".into()],
+        reason: None,
+    }));
+}
+
+fn open_plan_form(app: &mut App) {
+    app.state.mode = Mode::Plan;
+    app.plan_form.on_plan_ready();
+}
+
+/// The `y` was typed before the agent asked, so it must not approve the
+/// call. That holds whether the handler finishes or the prompt taking the
+/// keyboard lets the keys go first. A plan form that already waited on the
+/// user makes the keyboard look the same before and after the prompt opens
+/// in front of it, and the `y` still was not typed at that prompt.
+#[test_case(|_| {}, true         ; "when_the_handler_is_done")]
+#[test_case(|_| {}, false        ; "when_the_prompt_takes_the_keyboard")]
+#[test_case(open_plan_form, true ; "over_another_prompt")]
+fn held_keys_never_answer_a_prompt_that_opened_while_they_waited(
+    setup: fn(&mut App),
+    handler_done: bool,
+) {
+    let mut app = test_app();
+    let probe = install_override(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+    setup(&mut app);
+    let answer_rx = answer_channel(&mut app);
+
+    let tab = press_bound(&mut app, &probe, KeyCode::Tab);
+    type_keys(&mut app, "y");
+    ask_permission(&mut app);
+    if handler_done {
+        app.keybind_done(tab.id());
+    } else {
+        let _ = app.tick();
+    }
+
+    assert!(app.permission_prompt.is_open());
+    assert!(answer_rx.is_empty(), "the held y answered the prompt");
+    assert_eq!(app.status_bar.flash_text(), Some(HELD_KEYS_DROPPED));
+}
+
+/// The plan form closed and opened again while the keys waited leaves the
+/// same prompts up, yet it is not the form they were typed at.
+#[test]
+fn held_keys_never_reach_a_plan_form_opened_again() {
+    let mut app = plan_app();
+    let probe = install_override(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+
+    let tab = press_bound(&mut app, &probe, KeyCode::Tab);
+    app.update(Msg::Key(key(KeyCode::Esc)));
+    app.run_builtin(BuiltinAction::PlanToggle);
+    app.run_builtin(BuiltinAction::PlanToggle);
+    app.keybind_done(tab.id());
+
+    assert!(app.plan_form.is_visible(), "the held Esc closed the form");
+    assert_eq!(app.status_bar.flash_text(), Some(HELD_KEYS_DROPPED));
+}
+
+/// Held keys tell a prompt opened again from the one they were typed at by
+/// how many prompts opened, so a modal toggled open counts and one toggled
+/// closed does not.
+#[test_case("/help"  ; "help")]
+#[test_case("/usage" ; "usage")]
+fn a_modal_toggled_open_counts_as_a_prompt_opened(cmdline: &str) {
+    let mut app = test_app();
+    app.execute_command(cmd(cmdline), 0);
+    assert_eq!(app.prompts_opened, 1);
+    app.execute_command(cmd(cmdline), 0);
+    assert_eq!(app.prompts_opened, 1);
+}
+
+/// A prompt already up when the key was pressed does not stop the keys after
+/// it from following the keyboard into a window the handler opened.
+#[test]
+fn held_keys_follow_a_window_the_handler_opened_over_a_prompt() {
+    let mut app = test_app();
+    let probe = install_override(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+    app.pending_input = PendingInput::AuthRetry { subagent_id: None };
+
+    let tab = press_bound(&mut app, &probe, KeyCode::Tab);
+    type_keys(&mut app, "x");
+    let (event_tx, events) = flume::unbounded();
+    let (_cmd_tx, cmd_rx) = flume::unbounded();
+    app.float_mgr.open(
+        Arc::new(SharedBuf::new()),
+        FloatConfig::default(),
+        true,
+        event_tx,
+        cmd_rx,
+    );
+    app.keybind_done(tab.id());
+
+    assert!(took_a_key(&events), "the held key reached the window");
+    assert_ne!(app.status_bar.flash_text(), Some(HELD_KEYS_DROPPED));
+}
+
+/// A handler we stopped waiting for can finish while a later key holds, and
+/// its report must not let that key's followers go early.
+#[test]
+fn only_the_holding_handler_lets_the_keys_go() {
+    let (mut app, probe) = app_binding(KeyCode::Tab);
+
+    let tab = press_bound(&mut app, &probe, KeyCode::Tab);
+    type_keys(&mut app, "x");
+    app.keybind_done(tab.id() + 1);
+    assert_eq!(
+        app.input_box.buffer.value(),
+        "",
+        "another keystroke's report"
+    );
+    app.keybind_done(tab.id());
+    assert_eq!(app.input_box.buffer.value(), "x");
+}
+
+/// Another plugin's edit while the Enter waited, a timer's for one, changes
+/// the text the user saw just the same. The Enter is dropped with a hint, and
+/// the next one sends.
+#[test]
+fn an_enter_held_while_another_plugin_edited_sends_nothing() {
+    let (mut app, probe) = app_binding(KeyCode::Tab);
+    type_keys(&mut app, "hi");
+
+    let tab = press_bound(&mut app, &probe, KeyCode::Tab);
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    let edit = planned_edit(&app, 2, 2, "!");
+    apply_edit(&mut app, edit).unwrap();
+    let actions = app.keybind_done(tab.id());
+
+    assert_unsent(&app, &actions, "hi!");
+    let actions = app.update(Msg::Key(key(KeyCode::Enter)));
+    assert!(matches!(&actions[..], [Action::SendMessage(s)] if s.message == "hi!"));
+}
+
+/// Leaving cannot wait on a plugin, but the input it would clear is not yet
+/// what the user typed. The first `Ctrl+C` drops the keys and the fallback
+/// still waiting, and only that. An empty input must not quit or stop the
+/// turn because the typed keys had not landed yet. The next one acts.
+#[test_case("hi", false ; "clears_nothing_on_a_draft")]
+#[test_case("",   false ; "does_not_quit_when_idle")]
+#[test_case("",   true  ; "does_not_cancel_a_running_turn")]
+fn ctrl_c_first_drops_the_held_keys(text: &str, streaming: bool) {
+    let (mut app, probe) = app_binding(KeyCode::Char('a'));
+    type_keys(&mut app, text);
+    if streaming {
+        let _answers = answer_channel(&mut app);
+    }
+
+    let pressed = press_bound(&mut app, &probe, KeyCode::Char('a'));
+    type_keys(&mut app, "bc");
+    let actions = app.update(Msg::Key(kb::QUIT.to_key_event()));
+    assert!(actions.is_empty());
+    assert_eq!(app.exit_request, ExitRequest::None);
+    assert_eq!(
+        app.status,
+        if streaming {
+            Status::Streaming
+        } else {
+            Status::Idle
+        }
+    );
+    assert_eq!(app.status_bar.flash_text(), Some(HELD_KEYS_ABANDONED));
+
+    app.keybind_fallback(pressed.id());
+    app.keybind_done(pressed.id());
+    assert_eq!(app.input_box.buffer.value(), text, "nothing held landed");
+
+    app.update(Msg::Key(kb::QUIT.to_key_event()));
+    if !text.is_empty() {
+        assert_eq!(app.input_box.buffer.value(), "");
+    } else if streaming {
+        assert_ne!(app.status, Status::Streaming);
+    } else {
+        assert_eq!(app.exit_request, ExitRequest::Success);
+    }
+}
+
+/// A popup ahead of it may take `Esc`, so while the agent runs it still
+/// waits its turn behind the held keys, and cancels once they have gone.
+#[test]
+fn a_streaming_esc_waits_its_turn_then_cancels() {
+    let (mut app, probe) = app_binding(KeyCode::Tab);
+    let _answers = answer_channel(&mut app);
+
+    let tab = press_bound(&mut app, &probe, KeyCode::Tab);
+    type_keys(&mut app, "x");
+    app.update(Msg::Key(key(KeyCode::Esc)));
+    app.update(Msg::Key(key(KeyCode::Esc)));
+    assert!(
+        app.last_esc.is_none(),
+        "the Esc went ahead of the held keys"
+    );
+
+    let actions = app.keybind_done(tab.id());
+    assert_eq!(app.input_box.buffer.value(), "x");
+    assert!(
+        actions
+            .iter()
+            .any(|action| matches!(action, Action::CancelAgent { .. }))
+    );
+}
+
+/// With no typed key waiting, there is nothing for `Ctrl+C` to stop at. The
+/// pending fallback goes quietly and the press acts as usual.
+#[test]
+fn ctrl_c_drops_a_lone_fallback_and_acts() {
+    let (mut app, probe) = app_binding(KeyCode::Char('a'));
+    type_keys(&mut app, "hi");
+
+    let pressed = press_bound(&mut app, &probe, KeyCode::Char('a'));
+    app.update(Msg::Key(kb::QUIT.to_key_event()));
+    assert_eq!(app.input_box.buffer.value(), "");
+    assert_ne!(app.status_bar.flash_text(), Some(HELD_KEYS_ABANDONED));
+
+    app.keybind_fallback(pressed.id());
+    app.keybind_done(pressed.id());
+    assert_eq!(app.input_box.buffer.value(), "", "the dropped fallback ran");
+}
+
+/// `Ctrl+C` skips the wait, so it can come while a popup's handler holds.
+/// It can never be bound, so it walks past the popup's bindings and acts.
+#[test]
+fn ctrl_c_walks_past_a_popup_while_its_handler_holds() {
+    let mut app = test_app();
+    let buf = Arc::new(SharedBuf::new());
+    let _window = open_window(&mut app, &buf, false, WINDOW_Z);
+    let probe = bind_all(
+        &mut app,
+        plugin_key(KeyCode::Tab, KeyModifiers::NONE),
+        &[(UNDER_PLUGIN, INSERT, Some(&buf))],
+    );
+    type_keys(&mut app, "hi");
+
+    press_bound(&mut app, &probe, KeyCode::Tab);
+    app.update(Msg::Key(kb::QUIT.to_key_event()));
+
+    assert_eq!(app.input_box.buffer.value(), "");
+}
+
+/// Switches to normal mode on `<M-n>`. In normal mode `a` switches back to
+/// insert mode and hands the key back, which would type it.
+const MODE_FLIPPING_LOGGER: &str = r#"
+maki.keymap.set("i", "<M-n>", function() maki.ui.set_mode("n") end)
+maki.keymap.set("n", "a", function(ev)
+    maki.ui.set_mode("i")
+    ev.fallback()
+end)
+"#;
+
+/// A normal mode key does not type, so neither does its fallback, even
+/// when the handler flips to insert mode just for it. The key acts as it
+/// would where the user pressed it.
+#[test]
+fn a_normal_mode_key_never_types_through_its_fallback() {
+    let host = granted_host(MODE_FLIPPING_LOGGER, &["session_read"]);
+    let (mut app, ui) = hosted_app(&host);
+    app.update(Msg::Key(KeyEvent::new(
+        KeyCode::Char('n'),
+        KeyModifiers::ALT,
+    )));
+    serve_handler(&mut app, &ui);
+
+    app.update(Msg::Key(key(KeyCode::Char('a'))));
+    serve_handler(&mut app, &ui);
+
+    assert_eq!(app.input_box.buffer.value(), "");
+}
+
+#[cfg(unix)]
+#[test]
+fn ctrl_z_suspends_at_once_and_keeps_the_held_keys() {
+    let (mut app, probe) = app_binding(KeyCode::Tab);
+
+    let tab = press_bound(&mut app, &probe, KeyCode::Tab);
+    type_keys(&mut app, "hi");
+    let actions = app.update(Msg::Key(kb::SUSPEND.to_key_event()));
+    assert!(matches!(&actions[..], [Action::Suspend]));
+
+    app.keybind_done(tab.id());
+    assert_eq!(app.input_box.buffer.value(), "hi");
+}
+
+/// The keys after a replayed `/fork` must replay once the fork has the
+/// keyboard, or they land in the tab the user left. The event loop runs the
+/// fork's action, which hands the rest to the new tab, and replays them there.
+#[test]
+fn keys_held_behind_a_fork_land_in_the_fork() {
+    const TYPED: &str = "hello";
+    let (mut app, probe) = app_binding(KeyCode::Tab);
+    let _live = attach_live_history(&mut app, vec![Message::user(LIVE_AGENT_TEXT.into())]);
+
+    let tab = press_bound(&mut app, &probe, KeyCode::Tab);
+    type_and_submit(&mut app, "/fork");
+    type_and_submit(&mut app, TYPED);
+    opened_fork(app.keybind_done(tab.id()));
+    assert_eq!(app.input_box.buffer.value(), "", "the original got no keys");
+
+    let mut fork = test_app();
+    app.hand_typeahead_to(&mut fork);
+    let actions = fork.replay_typeahead();
+    assert!(matches!(&actions[..], [Action::SendMessage(s)] if s.message == TYPED));
+}
+
+const FRONT_PLUGIN: &str = "front";
+const UNDER_PLUGIN: &str = "under";
+const FOCUSED_PLUGIN: &str = "focused";
+const GLOBAL_PLUGIN: &str = "global";
+const WINDOW_Z: u16 = 50;
+const BOUND_CHAR: char = 'x';
+
+/// Painted once, because only a window on screen is asked for keys. Keep the
+/// command sender alive, dropping it closes the window.
+fn open_window(
+    app: &mut App,
+    buf: &Arc<SharedBuf>,
+    focus: bool,
+    zindex: u16,
+) -> (flume::Receiver<WinEvent>, flume::Sender<WinCommand>) {
+    let (event_tx, event_rx) = flume::unbounded::<WinEvent>();
+    let (cmd_tx, cmd_rx) = flume::unbounded::<WinCommand>();
+    let config = FloatConfig {
+        zindex,
+        ..FloatConfig::default()
+    };
+    app.float_mgr
+        .open(Arc::clone(buf), config, focus, event_tx, cmd_rx);
+    let _ = draw_to_buffer(app);
+    (event_rx, cmd_tx)
+}
+
+/// Plugins like todo_write forget a session's window when the session ends
+/// and trust us to close it. One left open after `/new` would sit on top of
+/// the new chat with nobody to update or close it.
+#[test]
+fn windows_close_when_their_session_leaves_the_tab() {
+    let mut app = test_app();
+    let buf = Arc::new(SharedBuf::new());
+    let (events, _cmd_tx) = open_window(&mut app, &buf, false, WINDOW_Z);
+
+    app.reset_session();
+
+    assert!(!app.float_mgr.is_open());
+    assert!(events.try_iter().any(|ev| matches!(ev, WinEvent::Close)));
+}
+
+fn owner(probe: &RequestProbe) -> Option<String> {
+    probe.try_recv_ticket().map(|t| t.plugin().to_string())
+}
+
+/// The windows are opened back to front on purpose, so the front one wins by
+/// its `zindex` and not by when it opened.
+#[test_case(&[FRONT_PLUGIN, UNDER_PLUGIN, GLOBAL_PLUGIN] => Some(FRONT_PLUGIN.into()) ; "front_popup_beats_the_one_under_it")]
+#[test_case(&[UNDER_PLUGIN, GLOBAL_PLUGIN] => Some(UNDER_PLUGIN.into()) ; "popup_beats_a_global_binding")]
+#[test_case(&[GLOBAL_PLUGIN] => Some(GLOBAL_PLUGIN.into()) ; "global_binding_beats_the_built_in_key")]
+#[test_case(&[] => None ; "built_in_key_comes_last")]
+fn a_key_goes_to_the_first_binding_in_resolution_order(bound: &[&str]) -> Option<String> {
+    let mut app = test_app();
+    let (front, under) = (Arc::new(SharedBuf::new()), Arc::new(SharedBuf::new()));
+    let _under = open_window(&mut app, &under, false, WINDOW_Z);
+    let _front = open_window(&mut app, &front, false, WINDOW_Z + 1);
+    let binds: Vec<Bind> = bound
+        .iter()
+        .map(|&plugin| {
+            let buffer = match plugin {
+                FRONT_PLUGIN => Some(&front),
+                UNDER_PLUGIN => Some(&under),
+                _ => None,
+            };
+            (plugin, INSERT, buffer)
+        })
+        .collect();
+    let probe = bind_all(
+        &mut app,
+        plugin_key(KeyCode::Char(BOUND_CHAR), KeyModifiers::NONE),
+        &binds,
+    );
+
+    app.update(Msg::Key(key(KeyCode::Char(BOUND_CHAR))));
+
+    let owner = owner(&probe);
+    assert_eq!(
+        app.input_box.buffer.is_empty(),
+        owner.is_some(),
+        "the chat input typed the key only when no binding took it"
+    );
+    owner
+}
+
+/// A focused window gets every key, so its own bindings go first and nothing
+/// under it sees the key. The chat input is hidden behind the window, so the
+/// fallback goes to the window's `recv` instead.
+#[test]
+fn a_focused_windows_binding_beats_its_recv_and_falls_back_to_it() {
+    let mut app = test_app();
+    let buf = Arc::new(SharedBuf::new());
+    let (events, _cmd_tx) = open_window(&mut app, &buf, true, WINDOW_Z);
+    let probe = bind_all(
+        &mut app,
+        plugin_key(KeyCode::Enter, KeyModifiers::NONE),
+        &[
+            (FOCUSED_PLUGIN, EVERY_MODE, Some(&buf)),
+            (GLOBAL_PLUGIN, EVERY_MODE, None),
+        ],
+    );
+
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    let ticket = probe.try_recv_ticket().expect(OVERRIDE_DISPATCHED);
+    assert_eq!(ticket.plugin().as_ref(), FOCUSED_PLUGIN);
+    assert!(
+        !took_a_key(&events),
+        "the binding took it before the window"
+    );
+
+    app.keybind_fallback(ticket.id());
+    assert!(took_a_key(&events), "the window got the key back");
+}
+
+/// A picker's `<CR>` selects and closes. The close comes over the window's
+/// own channel, so it may still be waiting when the done report arrives, and
+/// the keys typed after the `<CR>` must not go to the window that is gone.
+#[test]
+fn keys_held_behind_a_window_that_closed_itself_reach_the_chat_input() {
+    const TYPED: &str = "hi";
+    let mut app = test_app();
+    let buf = Arc::new(SharedBuf::new());
+    let (events, cmd_tx) = open_window(&mut app, &buf, true, WINDOW_Z);
+    let probe = bind_all(
+        &mut app,
+        plugin_key(KeyCode::Enter, KeyModifiers::NONE),
+        &[(FOCUSED_PLUGIN, EVERY_MODE, Some(&buf))],
+    );
+
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    let ticket = probe.try_recv_ticket().expect(OVERRIDE_DISPATCHED);
+    type_keys(&mut app, TYPED);
+    cmd_tx.send(WinCommand::Close).unwrap();
+    app.keybind_done(ticket.id());
+
+    assert!(!took_a_key(&events));
+    assert_eq!(app.input_box.buffer.value(), TYPED);
+}
+
+/// The `<CR>` was meant for the picker, which its `<C-n>` handler closed
+/// while the `<CR>` waited. It follows the keyboard to the chat input, but
+/// the user never saw that input when they pressed it, so it sends nothing.
+#[test]
+fn an_enter_held_while_a_picker_closed_sends_nothing() {
+    const DRAFT: &str = "rm -rf";
+    let mut app = test_app();
+    let buf = Arc::new(SharedBuf::new());
+    let (_events, cmd_tx) = open_window(&mut app, &buf, true, WINDOW_Z);
+    let next = KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL);
+    let probe = bind_all(
+        &mut app,
+        plugin_key(next.code, next.modifiers),
+        &[(FOCUSED_PLUGIN, EVERY_MODE, Some(&buf))],
+    );
+    app.input_box.set_input(DRAFT);
+
+    app.update(Msg::Key(next));
+    let ticket = probe.try_recv_ticket().expect(OVERRIDE_DISPATCHED);
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    cmd_tx.send(WinCommand::Close).unwrap();
+    let actions = app.keybind_done(ticket.id());
+
+    assert_unsent(&app, &actions, DRAFT);
+}
+
+/// The handler switched tabs while the `<CR>` waited, so the draft it lands
+/// on is one the user never saw when they pressed it.
+#[test]
+fn an_enter_held_across_a_tab_switch_sends_nothing() {
+    const DRAFT: &str = "hi";
+    let (mut first, probe) = app_binding(KeyCode::Tab);
+    let mut second = test_app();
+    second.keymap_reader = first.keymap_reader.clone();
+    type_keys(&mut second, DRAFT);
+
+    let tab = press_bound(&mut first, &probe, KeyCode::Tab);
+    first.update(Msg::Key(key(KeyCode::Enter)));
+    first.hand_typeahead_to(&mut second);
+    let actions = second.keybind_done(tab.id());
+
+    assert_unsent(&second, &actions, DRAFT);
+}
+
+/// A completion popup's `<CR>` accepts and closes it, and a second `<CR>`
+/// typed right after waits for that. It would send text the user has not
+/// seen yet, so it sends nothing and says why, rather than ask the popup's
+/// plugin for a grant the user cannot give it.
+#[test]
+fn a_second_enter_behind_a_completion_sends_nothing() {
+    let mut app = test_app();
+    let buf = Arc::new(SharedBuf::new());
+    let (_events, cmd_tx) = open_window(&mut app, &buf, false, WINDOW_Z);
+    let probe = bind_all(
+        &mut app,
+        plugin_key(KeyCode::Enter, KeyModifiers::NONE),
+        &[(FRONT_PLUGIN, INSERT, Some(&buf))],
+    );
+    type_keys(&mut app, COMPLETED_WORD);
+
+    let mut accept = press_bound(&mut app, &probe, KeyCode::Enter);
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    let seen = serde_json::json!(accept.take_input().expect("the ticket carries the input"));
+    let edit = edit_planned_on(&seen, 0, COMPLETED_WORD.len(), COMPLETION);
+    apply_edit(&mut app, edit).unwrap();
+    cmd_tx.send(WinCommand::Close).unwrap();
+    let actions = app.keybind_done(accept.id());
+
+    assert_unsent(&app, &actions, COMPLETION);
+}
+
+/// The popup's keys come back as soon as the modal over it closes.
+#[test]
+fn a_host_modal_outranks_a_popups_bindings() {
+    let mut app = test_app();
+    let buf = Arc::new(SharedBuf::new());
+    let _window = open_window(&mut app, &buf, false, WINDOW_Z);
+    let probe = bind_all(
+        &mut app,
+        plugin_key(KeyCode::Esc, KeyModifiers::NONE),
+        &[(FRONT_PLUGIN, EVERY_MODE, Some(&buf))],
+    );
+
+    app.run_builtin(BuiltinAction::Help);
+    app.update(Msg::Key(key(KeyCode::Esc)));
+    assert!(!app.help_modal.is_open(), "the modal took the Esc");
+    assert_eq!(owner(&probe), None);
+
+    app.update(Msg::Key(key(KeyCode::Esc)));
+    assert_eq!(owner(&probe).as_deref(), Some(FRONT_PLUGIN));
+}
+
+/// A vim plugin in normal mode must keep its `<Esc>` even while the completion
+/// popup is up, so the popup's insert mode binding has to step aside.
+#[test]
+fn a_popup_binding_rests_outside_its_mode() {
+    let mut app = test_app();
+    let buf = Arc::new(SharedBuf::new());
+    let _window = open_window(&mut app, &buf, false, WINDOW_Z);
+    let probe = bind_all(
+        &mut app,
+        plugin_key(KeyCode::Esc, KeyModifiers::NONE),
+        &[
+            (GLOBAL_PLUGIN, NORMAL, None),
+            (FRONT_PLUGIN, INSERT, Some(&buf)),
+        ],
+    );
+    set_mode(&app.keymap_reader, InputMode::Normal);
+
+    app.update(Msg::Key(key(KeyCode::Esc)));
+
+    assert_eq!(owner(&probe).as_deref(), Some(GLOBAL_PLUGIN));
+}
+
+/// The fallback types the key in the spot the user pressed it: after the
+/// handler, before the `b` typed behind it. Once the handler is done the `b`
+/// has gone ahead, so a late fallback would land out of order.
+#[test]
+fn fallback_runs_the_built_in_key_once_before_the_keys_typed_after_it() {
+    let (mut app, probe) = app_binding(KeyCode::Char('a'));
+
+    let pressed = press_bound(&mut app, &probe, KeyCode::Char('a'));
+    type_keys(&mut app, "b");
+    app.keybind_fallback(pressed.id());
+    app.keybind_fallback(pressed.id());
+    assert_eq!(
+        app.input_box.buffer.value(),
+        "a",
+        "typed once, and b still waits"
+    );
+
+    app.keybind_done(pressed.id());
+    app.keybind_fallback(pressed.id());
+    assert_eq!(app.input_box.buffer.value(), "ab");
+}
+
+/// A handler that only falls back changes the text the way the user
+/// expected, so an Enter typed behind it still sends.
+#[test]
+fn an_enter_behind_a_fallback_sends() {
+    let (mut app, probe) = app_binding(KeyCode::Char('a'));
+    let pressed = press_bound(&mut app, &probe, KeyCode::Char('a'));
+    app.update(Msg::Key(key(KeyCode::Enter)));
+
+    app.keybind_fallback(pressed.id());
+    app.keybind_done(pressed.id());
+
+    assert_eq!(app.input_box.buffer.value(), "");
+    assert_ne!(app.status_bar.flash_text(), Some(INPUT_CHANGED_UNSENT));
+}
+
+/// The handler opened a window, so the key would land in it, or in the input
+/// the user already left. Neither is where they aimed it.
+#[test]
+fn fallback_is_dropped_once_the_keyboard_moved() {
+    let (mut app, probe) = app_binding(KeyCode::Char('a'));
+    let pressed = press_bound(&mut app, &probe, KeyCode::Char('a'));
+    let (events, _cmd_tx) = open_window(&mut app, &Arc::new(SharedBuf::new()), true, WINDOW_Z);
+
+    app.keybind_fallback(pressed.id());
+
+    assert!(!took_a_key(&events));
+    assert_eq!(app.input_box.buffer.value(), "");
+}
+
+#[test]
+fn a_paste_binding_gets_the_text_and_its_fallback_pastes_it() {
+    const MULTILINE: &str = "line one\nline two";
+    let mut app = test_app();
+    let probe = install_binding(&mut app, INSERT, PASTE);
+
+    app.update(Msg::Paste(MULTILINE.replace('\n', "\r\n")));
+    let ticket = probe.try_recv_ticket().expect(OVERRIDE_DISPATCHED);
+    assert_eq!(
+        ticket.text(),
+        Some(MULTILINE),
+        "line endings are already `\\n`"
+    );
+    assert_eq!(app.input_box.buffer.value(), "");
+
+    app.keybind_fallback(ticket.id());
+    assert_eq!(app.input_box.buffer.value(), MULTILINE);
+}
+
+/// A middle-click paste is read in the background, so it can come back
+/// while a handler holds the keys typed before the click. It lands after
+/// them, and a `<Paste>` binding runs once that handler is done.
+#[test_case(false ; "unbound")]
+#[test_case(true  ; "bound")]
+fn a_primary_paste_waits_behind_held_keys(paste_bound: bool) {
+    const TYPED: &str = "ab";
+    let mut app = test_app();
+    let tab = TestBinding {
+        plugin: GLOBAL_PLUGIN,
+        modes: INSERT,
+        key: plugin_key(KeyCode::Tab, KeyModifiers::NONE),
+        buffer: None,
+    };
+    let paste = TestBinding { key: PASTE, ..tab };
+    let binds = if paste_bound {
+        vec![tab, paste]
+    } else {
+        vec![tab]
+    };
+    app.keymap_reader = keymap_reader_from(&binds);
+    let probe = probe_events(&mut app);
+
+    let tab = press_bound(&mut app, &probe, KeyCode::Tab);
+    type_keys(&mut app, TYPED);
+    let (tx, rx) = flume::bounded(1);
+    app.primary_paste_rx.push(rx);
+    tx.send(Some(PRIMARY_TEXT.into())).unwrap();
+    // The poll alone, since a full tick lets a hold older than the slow
+    // handler warning go, which a loaded machine can reach.
+    let _ = app.poll_primary_paste();
+    assert_eq!(app.input_box.buffer.value(), "");
+    assert!(
+        probe.try_recv_ticket().is_none(),
+        "{OVERRIDE_NOT_DISPATCHED}"
+    );
+
+    app.keybind_done(tab.id());
+
+    if paste_bound {
+        assert_eq!(app.input_box.buffer.value(), TYPED);
+        let pasted = probe.try_recv_ticket().expect(OVERRIDE_DISPATCHED);
+        assert_eq!(pasted.text(), Some(PRIMARY_TEXT));
+    } else {
+        assert_eq!(
+            app.input_box.buffer.value(),
+            format!("{TYPED}{PRIMARY_TEXT}")
+        );
+    }
+}
+
+fn open_permission_prompt(app: &mut App) {
+    app.permission_prompt.push(
+        "perm-1".into(),
+        ToolKey::native("bash"),
+        vec!["execute".into()],
+        None,
+        true,
+        None,
+    );
+}
+
+fn open_alert(app: &mut App) {
+    app.open_alert("alert".into());
+}
+
+/// A modal owns the keyboard, so a paste it has no field for goes nowhere:
+/// not into the chat input under it, nor to a global `<Paste>` binding.
+#[test_case(open_permission_prompt as fn(&mut App) ; "permission_prompt")]
+#[test_case(open_alert                             ; "alert_modal")]
+#[test_case(open_help                              ; "help_modal")]
+#[test_case(focus_queue                            ; "queue_focus")]
+fn a_modal_drops_a_paste_it_has_no_field_for(open: fn(&mut App)) {
+    let mut app = test_app();
+    let probe = install_binding(&mut app, INSERT, PASTE);
+    open(&mut app);
+
+    app.update(Msg::Paste(PASTED.into()));
+
+    assert!(probe.try_recv_ticket().is_none());
+    assert_eq!(app.input_box.buffer.value(), "");
+}
+
+const TABBED_PASTE: &str = "a\tb\r\nc";
+const TABBED_PASTE_LF: &str = "a\tb\nc";
+
+/// Every `<Paste>` binding gets `ev.text` cleaned the way the input cleans
+/// text, so `#ev.text` is what inserting it adds wherever it was bound. A
+/// focused window with no binding gets the tabs as pasted in `recv`, with
+/// `\n` line endings.
+#[test_case(true, true   ; "binding_of_a_focused_window")]
+#[test_case(false, true  ; "binding_of_an_unfocused_window")]
+#[test_case(true, false  ; "recv_of_a_focused_window")]
+fn a_window_paste_is_cleaned_only_for_a_binding(focus: bool, bound: bool) {
+    let mut app = test_app();
+    let buf = Arc::new(SharedBuf::new());
+    let (events, _cmd_tx) = open_window(&mut app, &buf, focus, WINDOW_Z);
+    let binds = [(FOCUSED_PLUGIN, EVERY_MODE, Some(&buf))];
+    let probe = bind_all(&mut app, PASTE, if bound { &binds } else { &[] });
+
+    app.update(Msg::Paste(TABBED_PASTE.into()));
+
+    let pasted = match probe.try_recv_ticket() {
+        Some(ticket) => ticket.text().map(str::to_owned),
+        None => events.drain().find_map(|e| match e {
+            WinEvent::Paste { text } => Some(text),
+            _ => None,
+        }),
+    };
+    let expected = if bound {
+        sanitize(TABBED_PASTE)
+    } else {
+        TABBED_PASTE_LF.to_owned()
+    };
+    assert_eq!(pasted, Some(expected));
+}
+
+/// The `\` + Enter continuation, written as a plugin. The built-in editor
+/// already does this, so the test also has to check which path ran.
+const CONTINUATION_PLUGIN: &str = r#"
+maki.keymap.set("i", "<CR>", function(ev)
+    local st = ev.input
+    if st.text:sub(st.cursor, st.cursor) ~= "\\" then
+        return ev.fallback()
+    end
+    maki.ui.input_edit({
+        start = st.cursor - 1, stop = st.cursor, text = "\n",
+        version = st.version, session_id = st.session_id,
+    })
+end)
+"#;
+const HANDLER_TIMEOUT: Duration = Duration::from_secs(30);
+const HANDLER_NEVER_DONE: &str = "the key handler never reported done";
+const ASKED_EDIT: &str = "edit";
+const ASKED_FALLBACK: &str = "fallback";
+
+fn new_host() -> PluginHost {
+    PluginHost::new(Arc::new(ToolRegistry::new())).unwrap()
+}
+
+/// Wires {host} into a fresh app the way the event loop does.
+fn hosted_app(host: &PluginHost) -> (App, flume::Receiver<UiAction>) {
+    let mut app = test_app();
+    app.keymap_reader = host.keymap_reader();
+    app.lua_event_handle = host.event_handle();
+    (app, host.ui_action_rx())
+}
+
+/// A host running {source} as {plugin}, and a fresh app wired to it.
+fn plugin_app(plugin: &str, source: &str) -> (PluginHost, App, flume::Receiver<UiAction>) {
+    let host = new_host();
+    host.load_source(plugin, source).unwrap();
+    let (app, ui) = hosted_app(&host);
+    (host, app, ui)
+}
+
+/// Plays the event loop for one key handler until it reports done. Returns
+/// what it asked for, in order, with the text of each flash, and the actions
+/// its fallback and built-in actions made.
+fn serve_handler(app: &mut App, ui: &flume::Receiver<UiAction>) -> (Vec<String>, Vec<Action>) {
+    let (mut asked, mut actions) = (Vec::new(), Vec::new());
+    loop {
+        match ui.recv_timeout(HANDLER_TIMEOUT).expect(HANDLER_NEVER_DONE) {
+            UiAction::Input {
+                req: InputRequest::Read,
+                reply_tx,
+            } => {
+                let _ = reply_tx.send(Ok(app.input_snapshot()));
+            }
+            UiAction::Input {
+                req: InputRequest::Edit(edit),
+                reply_tx,
+            } => {
+                asked.push(ASKED_EDIT.into());
+                let _ = reply_tx.send(app.apply_input_edit(edit, TEST_AREA));
+            }
+            UiAction::Input {
+                req: InputRequest::Submit(req),
+                reply_tx,
+            } => {
+                let reply = app.submit_input(req, TEST_AREA).map(|sent| {
+                    actions.extend(sent);
+                    serde_json::json!(true)
+                });
+                let _ = reply_tx.send(reply);
+            }
+            UiAction::KeybindFallback(ticket) => {
+                asked.push(ASKED_FALLBACK.into());
+                actions.extend(app.keybind_fallback(ticket));
+            }
+            UiAction::Builtin {
+                action,
+                caller,
+                reply_tx,
+            } => {
+                let (handled, made) = app.run_action(action, Some(&caller));
+                actions.extend(made);
+                let _ = reply_tx.send(handled);
+            }
+            UiAction::Flash(msg) => asked.push(msg),
+            UiAction::KeybindDone(ticket) => {
+                app.keybind_done(ticket);
+                return (asked, actions);
+            }
+            _ => {}
+        }
+    }
+}
+
+#[test]
+fn backslash_enter_works_as_a_plugin_built_on_fallback() {
+    let (_host, mut app, ui) = plugin_app("continuation", CONTINUATION_PLUGIN);
+
+    type_keys(&mut app, "a\\");
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    type_keys(&mut app, "b");
+    assert_eq!(serve_handler(&mut app, &ui).0, [ASKED_EDIT]);
+    assert_eq!(app.input_box.buffer.value(), "a\nb");
+
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    let (asked, actions) = serve_handler(&mut app, &ui);
+    assert_eq!(asked, [ASKED_FALLBACK]);
+    assert!(matches!(&actions[..], [Action::SendMessage(s)] if s.message == "a\nb"));
+}
+
+const GRANTED_PLUGIN: &str = "granted";
+const PASSING_ENTER_PLUGIN: &str = r#"
+maki.keymap.set("i", "<CR>", function(ev) ev.fallback() end)
+"#;
+const EDITING_ENTER_PLUGIN: &str = r#"
+maki.keymap.set("i", "<CR>", function(ev)
+    local st = ev.input
+    maki.ui.input_edit({
+        start = #st.text, stop = #st.text, text = "!", cursor = st.cursor,
+        version = st.version, session_id = st.session_id,
+    })
+    ev.fallback()
+end)
+"#;
+const IDLE_X_PLUGIN: &str = r#"maki.keymap.set("i", "x", function() end)"#;
+const MOVING_X_PLUGIN: &str = r#"
+maki.keymap.set("i", "x", function(ev)
+    maki.ui.input_edit({
+        edits = {}, cursor = 0,
+        version = ev.input.version, session_id = ev.input.session_id,
+    })
+end)
+"#;
+
+/// A host running {source} with only {grants}.
+fn granted_host(source: &str, grants: &[&str]) -> PluginHost {
+    let host = new_host();
+    host.load_source_with_permissions(
+        GRANTED_PLUGIN,
+        source,
+        PluginPermissions::from_approved(grants.iter().copied()),
+    )
+    .unwrap();
+    host
+}
+
+/// The user pressed Enter on what they typed, so passing it on needs no
+/// grant. Text that changed since the press is never sent by a fallback,
+/// and no grant of the handler changes that, since the Enter is the user's.
+#[test_case(PASSING_ENTER_PLUGIN, &[],                 "hi",  true  ; "passed_on_needs_nothing")]
+#[test_case(EDITING_ENTER_PLUGIN, &["input", "agent", "session_read", "session_write"], "hi!", false ; "edited_sends_nothing")]
+fn a_fallback_enter_sends(source: &str, grants: &[&str], text: &str, sends: bool) {
+    let host = granted_host(source, grants);
+    let (mut app, ui) = hosted_app(&host);
+
+    type_keys(&mut app, "hi");
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    let (_, actions) = serve_handler(&mut app, &ui);
+    if sends {
+        assert!(matches!(&actions[..], [Action::SendMessage(s)] if s.message == text));
+    } else {
+        assert_unsent(&app, &actions, text);
+    }
+}
+
+/// Binds `x` to put {text} in place of the input.
+fn rewriting_plugin(text: &str) -> String {
+    format!(
+        r#"
+maki.keymap.set("i", "x", function(ev)
+    local st = ev.input
+    maki.ui.input_edit({{
+        start = 0, stop = #st.text, text = "{text}",
+        version = st.version, session_id = st.session_id,
+    }})
+end)
+"#
+    )
+}
+
+/// The Enter typed while the `x` handler ran waited for it. Once the handler
+/// changed the input, the user never saw what the Enter would send, so it
+/// sends nothing, whatever the plugin may do.
+#[test_case(&rewriting_plugin("hello"), &["input", "agent", "session_read", "session_write"], "hello", Some(INPUT_CHANGED_UNSENT) ; "a_message")]
+#[test_case(MOVING_X_PLUGIN, &["input", "agent", "session_read"], "hi", Some(INPUT_CHANGED_UNSENT) ; "a_moved_cursor")]
+#[test_case(IDLE_X_PLUGIN, &["session_read"], "", None ; "an_untouched_input_needs_nothing_more")]
+fn an_enter_held_while_a_handler_changed_the_input_sends_nothing(
+    source: &str,
+    grants: &[&str],
+    left: &str,
+    flash: Option<&str>,
+) {
+    let host = granted_host(source, grants);
+    let (mut app, ui) = hosted_app(&host);
+
+    type_keys(&mut app, "hix");
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    serve_handler(&mut app, &ui);
+
+    assert_eq!(app.input_box.buffer.value(), left);
+    assert_eq!(app.status_bar.flash_text(), flash);
+    assert!(!app.permissions.is_yolo());
+}
+
+/// The first send uses the version it read, which its own edit just made
+/// stale, and flashes the refusal so the test can see it.
+const SUBMIT_PLUGIN: &str = r#"
+maki.keymap.set("i", "<CR>", function(ev)
+    local st = ev.input
+    local edited = maki.ui.input_edit({
+        start = #st.text, stop = #st.text, text = "!",
+        version = st.version, session_id = st.session_id,
+    })
+    local ok, err = maki.ui.input_submit({ version = st.version, session_id = st.session_id })
+    if not ok then maki.ui.flash(err) end
+    maki.ui.input_submit({ version = edited.version, session_id = st.session_id })
+end)
+"#;
+
+/// The first message starts the agent, so the second one has to wait in the
+/// queue.
+#[test]
+fn a_handler_edits_then_submits_like_a_typed_enter() {
+    let (_host, mut app, ui) = plugin_app("shout", SUBMIT_PLUGIN);
+
+    type_keys(&mut app, "hi");
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    let (asked, actions) = serve_handler(&mut app, &ui);
+    let [edit, refusal] = &asked[..] else {
+        panic!("{asked:?}");
+    };
+    assert_eq!(edit, ASKED_EDIT);
+    assert!(refusal.starts_with(STALE_VERSION_ERR), "{refusal}");
+    assert!(matches!(&actions[..], [Action::SendMessage(s)] if s.message == "hi!"));
+    assert_eq!(app.input_box.buffer.value(), "");
+
+    type_keys(&mut app, "more");
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    let (_, actions) = serve_handler(&mut app, &ui);
+    assert!(!actions.iter().any(|a| matches!(a, Action::SendMessage(_))));
+    assert_eq!(app.queue.text_messages(), ["more!"]);
+
+    app.input_box.history_up();
+    assert_eq!(app.input_box.buffer.value(), "more!");
+    app.input_box.history_up();
+    assert_eq!(app.input_box.buffer.value(), "hi!");
+}
+
+fn current_submit(app: &App, caller: PluginReach) -> InputSubmit {
+    let st = app.input_snapshot();
+    InputSubmit {
+        version: st["version"].as_u64().unwrap(),
+        session_id: st["session_id"].as_str().unwrap().into(),
+        caller,
+    }
+}
+
+/// The agent is busy, so a message that got out would sit in the queue next
+/// to the one already there. A user-only command is left to the user.
+#[test_case(|_| {}, "/yolo", &format!("/yolo{USER_ONLY_SUFFIX}") ; "a_user_only_command")]
+#[test_case(|app| app.help_modal.toggle(), "hello", SUBMIT_NOT_LIVE_ERR ; "a_modal_is_open")]
+#[test_case(|app| app.queue.set_focus_at(0), "hello", SUBMIT_NOT_LIVE_ERR ; "the_queue_has_the_keyboard")]
+#[test_case(|_| {}, "  ", NOTHING_TO_SEND_ERR ; "blank")]
+#[test_case(|app| app.command_palette.unselect(&app.input_box.buffer), "/help", NO_COMMAND_MATCHED_ERR ; "the_palette_swallows_enter")]
+fn a_submit_is_refused_where_enter_would_not_send(setup: fn(&mut App), text: &str, err: &str) {
+    let mut app = app_with_queued_message();
+    type_keys(&mut app, text);
+    setup(&mut app);
+
+    let req = current_submit(&app, trusted());
+    assert_eq!(app.submit_input(req, TEST_AREA).err().as_deref(), Some(err));
+    assert_eq!(app.input_box.buffer.value(), text);
+    assert_eq!(app.queue.len(), 1);
+    assert!(!app.permissions.is_yolo());
+}
+
+#[test]
+fn a_submitted_slash_command_runs_like_enter() {
+    let mut app = test_app();
+    type_keys(&mut app, "/help");
+
+    let req = current_submit(&app, trusted());
+    app.submit_input(req, TEST_AREA).unwrap();
+    assert!(app.help_modal.is_open());
+    assert_eq!(app.input_box.buffer.value(), "");
+}
+
+/// A plugin's submit needs what doing the same thing directly needs. Holding
+/// only those grants is enough, and lacking any one of them is not.
+#[test_case(test_app, "hello", SEND_MESSAGE, PROMPT_NEEDS ; "a_message")]
+#[test_case(app_with_queued_message, "hello", SEND_MESSAGE, PROMPT_NEEDS ; "a_message_for_the_queue")]
+#[test_case(test_app, "!ls", RUN_SHELL_LINE, &[Permission::Run] ; "a_shell_line")]
+#[test_case(test_app, "!! ls", RUN_SHELL_LINE, &[Permission::Run] ; "a_hidden_shell_line")]
+#[test_case(test_app, "/btw hi", "/btw", &[Permission::Agent] ; "a_command_that_starts_a_turn")]
+fn a_submit_needs_the_grant_of_what_enter_would_do(
+    app: fn() -> App,
+    text: &str,
+    what: &str,
+    needed: &[Permission],
+) {
+    let mut app = app();
+    type_keys(&mut app, text);
+    let queued = app.queue.len();
+
+    for &permission in needed {
+        let refused = app.submit_input(current_submit(&app, without(permission)), TEST_AREA);
+        assert_eq!(
+            refused.err(),
+            Some(Missing::Permission(permission).refusal(what))
+        );
+        assert_eq!(app.input_box.buffer.value(), text);
+        assert_eq!(app.queue.len(), queued);
+    }
+
+    app.submit_input(current_submit(&app, only_these(needed)), TEST_AREA)
+        .unwrap();
+    assert_eq!(app.input_box.buffer.value(), "");
+}
+
+const PLAIN_LINE: &str = "say hi";
+const SHELL_LINE: &str = "!ls";
+const PLUGIN_MANIFEST: &str = "plugin.toml";
+const NO_GRANTS_EDIT: &str = r#"
+maki.keymap.set("i", "<C-x>", function(ev)
+  local _, err = pcall(maki.ui.input_edit, {
+    start = 0, stop = 0, text = "x", version = 0, session_id = "",
+  })
+  maki.ui.flash(tostring(err))
+end)
+"#;
+
+fn holding(permissions: &[Permission]) -> PluginReach {
+    PluginReach::new(PluginPermissions::from_approved(
+        permissions
+            .iter()
+            .map(|permission| permission.manifest_key()),
+    ))
+}
+
+const WRITER: &str = "vim";
+const YOLO: &str = "/yolo";
+const COMPACT: &str = "/compact";
+
+fn named(reach: PluginReach) -> PluginReach {
+    reach.owned_by(Arc::from(WRITER))
+}
+
+fn user_only(command: &str) -> String {
+    format!("{command}{USER_ONLY_SUFFIX}")
+}
+
+fn written(writer: &str, what: &str, reason: &str) -> String {
+    format!("{writer} wrote part of this {what}: {TYPE_IT_YOURSELF} ({reason})")
+}
+
+fn run_refused() -> String {
+    Missing::Permission(Permission::Run).refusal(RUN_SHELL_LINE)
+}
+
+/// A plugin whose text Enter may send as a message.
+fn sender() -> PluginReach {
+    holding(&[
+        Permission::Input,
+        Permission::Agent,
+        Permission::SessionWrite,
+    ])
+}
+
+fn message_refused() -> String {
+    Missing::Permission(Permission::Agent).refusal(SEND_MESSAGE)
+}
+
+/// Writes {text} over the whole input as {writer} would with `input_edit`.
+fn write_as(app: &mut App, text: &str, writer: PluginReach) {
+    let len = app.input_box.buffer.value().len();
+    let edit = InputEdit {
+        caller: writer,
+        ..planned_edit(app, 0, len, text)
+    };
+    apply_edit(app, edit).unwrap();
+}
+
+/// Enter, and the flash when it left the input as it was.
+fn press_enter(app: &mut App) -> Result<(), String> {
+    let before = app.input_box.buffer.value().to_owned();
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    if app.input_box.buffer.value() == before {
+        return Err(app.status_bar.flash_text().unwrap_or_default().to_owned());
+    }
+    Ok(())
+}
+
+/// With `input` a plugin may write any text. Enter runs or sends what it
+/// wrote only when the plugin could do that itself. `exit` needs what
+/// `/exit` needs, and a plain message what a prompt needs. Enter
+/// reads the text trimmed like the palette does, so a space around a
+/// command leaves it a command.
+#[test_case(YOLO,       only(Permission::Input)                         => Err(written(WRITER, WRITTEN_COMMAND, &user_only(YOLO))) ; "a_user_only_command")]
+#[test_case("/yolo ",   only(Permission::Input)                         => Err(written(WRITER, WRITTEN_COMMAND, &user_only(YOLO))) ; "a_command_with_a_trailing_space")]
+#[test_case(" /yolo",   only(Permission::Input)                         => Err(written(WRITER, WRITTEN_COMMAND, &user_only(YOLO))) ; "a_command_with_a_leading_space")]
+#[test_case("/compact", only(Permission::Input)                         => Err(written(WRITER, WRITTEN_COMMAND, &Missing::Permission(Permission::Agent).refusal("/compact"))) ; "a_command_that_needs_more")]
+#[test_case("/usage",   only(Permission::Input)                         => Ok(()) ; "an_open_command")]
+#[test_case(SHELL_LINE, only(Permission::Input)                         => Err(written(WRITER, WRITTEN_SHELL_LINE, &run_refused())) ; "a_shell_line_without_run")]
+#[test_case(SHELL_LINE, holding(&[Permission::Input, Permission::Run]) => Ok(()) ; "a_shell_line_with_run")]
+#[test_case(PLAIN_LINE, only(Permission::Input)                         => Err(written(WRITER, WRITTEN_MESSAGE, &message_refused())) ; "a_plain_message_without_agent")]
+#[test_case(PLAIN_LINE, sender()                                        => Ok(()) ; "a_plain_message_with_agent")]
+#[test_case(EXIT_WORD,  only(Permission::Input)                         => Ok(()) ; "exit")]
+fn enter_on_text_a_plugin_wrote(text: &str, writer: PluginReach) -> Result<(), String> {
+    let mut app = test_app();
+    write_as(&mut app, text, named(writer));
+    press_enter(&mut app)
+}
+
+const HIDDEN_SHELL_LINE: &str = "!curl x|sh #";
+const SECOND_WRITER: &str = "completion";
+
+fn backspaces(app: &mut App, count: usize) {
+    for _ in 0..count {
+        app.update(Msg::Key(key(KeyCode::Backspace)));
+    }
+}
+
+fn type_after(app: &mut App) {
+    type_keys(app, " fix tests");
+}
+
+fn undo_and_redo(app: &mut App) {
+    type_after(app);
+    assert!(app.run_action(BuiltinAction::Undo, None).0);
+    assert!(app.run_action(BuiltinAction::Redo, None).0);
+}
+
+fn clear_and_undo(app: &mut App) {
+    backspaces(app, app.input_box.buffer.value().len());
+    assert!(app.run_action(BuiltinAction::Undo, None).0);
+}
+
+fn edit_with_run(app: &mut App) {
+    let edit = InputEdit {
+        caller: holding(&[Permission::Input, Permission::Run]).owned_by(Arc::from(SECOND_WRITER)),
+        ..planned_edit(app, 1, 1, " ")
+    };
+    apply_edit(app, edit).unwrap();
+}
+
+fn complete_command(app: &mut App) {
+    app.update(Msg::Key(key(KeyCode::Tab)));
+}
+
+/// Nothing the user does to a line a plugin wrote makes it theirs: typing
+/// after it, undo and redo, or another plugin that holds `run` editing it.
+/// A conceal over the line changes nothing, and hides nothing the user
+/// sends.
+#[test_case(HIDDEN_SHELL_LINE, type_after,       WRITTEN_SHELL_LINE ; "typing_after_a_concealed_line")]
+#[test_case(PLAIN_LINE,        type_after,       WRITTEN_MESSAGE    ; "typing_after_a_concealed_message")]
+#[test_case(SHELL_LINE,        undo_and_redo,    WRITTEN_SHELL_LINE ; "undo_and_redo")]
+#[test_case(SHELL_LINE,        clear_and_undo,   WRITTEN_SHELL_LINE ; "an_undo_past_a_clear")]
+#[test_case(SHELL_LINE,        edit_with_run,    WRITTEN_SHELL_LINE ; "a_second_plugin_with_run")]
+#[test_case("/yol",            complete_command, WRITTEN_COMMAND    ; "a_completed_command")]
+fn a_line_a_plugin_wrote_stays_its(text: &str, then: fn(&mut App), what: &str) {
+    let mut app = test_app();
+    let conceal = Mark {
+        start: 0,
+        stop: Some(text.len()),
+        decoration: Arc::new(Decoration {
+            conceal: Some(String::new()),
+            ..Decoration::default()
+        }),
+    };
+    let edit = InputEdit {
+        caller: named(only(Permission::Input)),
+        marks: Some(InputMarks {
+            ns: EDIT_PLUGIN.into(),
+            marks: vec![conceal],
+        }),
+        ..planned_edit(&app, 0, 0, text)
+    };
+    apply_edit(&mut app, edit).unwrap();
+    then(&mut app);
+
+    let refusal = press_enter(&mut app).unwrap_err();
+    let reason = match what {
+        WRITTEN_SHELL_LINE => run_refused(),
+        WRITTEN_MESSAGE => message_refused(),
+        _ => user_only(YOLO),
+    };
+    assert_eq!(refusal, written(WRITER, what, &reason));
+}
+
+/// The refusal names every plugin that wrote the line and could not run it.
+#[test]
+fn a_refusal_names_each_writer_once() {
+    let mut app = test_app();
+    write_as(&mut app, SHELL_LINE, named(only(Permission::Input)));
+    let second = InputEdit {
+        caller: only(Permission::Input).owned_by(Arc::from(SECOND_WRITER)),
+        ..planned_edit(&app, 1, 1, " ")
+    };
+    apply_edit(&mut app, second).unwrap();
+    write_as(&mut app, SHELL_LINE, named(only(Permission::Input)));
+
+    let names = format!("{WRITER}, {SECOND_WRITER}");
+    assert_eq!(
+        press_enter(&mut app).err(),
+        Some(written(&names, WRITTEN_SHELL_LINE, &run_refused()))
+    );
+}
+
+/// Clearing the input starts it over, so what the user types next is
+/// theirs.
+#[test]
+fn a_command_a_plugin_wrote_runs_once_the_user_retypes_it() {
+    let mut app = test_app();
+    write_as(&mut app, YOLO, named(only(Permission::Input)));
+    assert!(press_enter(&mut app).is_err());
+
+    backspaces(&mut app, YOLO.len());
+    type_keys(&mut app, YOLO);
+    press_enter(&mut app).unwrap();
+    assert!(app.permissions.is_yolo());
+}
+
+/// A login retry sends none of the text, so the input stays as it was and
+/// history does not keep it for a recall to bring back as the user's.
+#[test]
+fn a_login_retry_leaves_the_input_alone() {
+    let (_tmp, _dir, _writer, mut app) = tempdir_app();
+    app.pending_input = PendingInput::AuthRetry { subagent_id: None };
+    write_as(&mut app, SHELL_LINE, named(only(Permission::Input)));
+
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    assert_eq!(app.pending_input, PendingInput::None);
+    assert_eq!(app.input_box.buffer.value(), SHELL_LINE);
+    assert!(app.input_box.history().is_empty());
+}
+
+/// `Esc` closes the palette, and Enter then sends the text as a message.
+/// A recall would open the palette on a `/` text as the user's, so one a
+/// plugin wrote stays out of history.
+#[test_case(PARTIAL_YOLO, true  => false ; "a_command_prefix_a_plugin_wrote")]
+#[test_case(PARTIAL_YOLO, false => true  ; "a_command_prefix_the_user_typed")]
+#[test_case(PLAIN_LINE,   true  => true  ; "a_message_a_plugin_wrote")]
+fn enter_after_esc_keeps_in_history(text: &str, by_plugin: bool) -> bool {
+    let (_tmp, _dir, _writer, mut app) = tempdir_app();
+    if by_plugin {
+        write_as(&mut app, text, named(sender()));
+    } else {
+        type_keys(&mut app, text);
+    }
+    app.update(Msg::Key(key(KeyCode::Esc)));
+
+    press_enter(&mut app).unwrap();
+    assert!(!app.permissions.is_yolo());
+    !app.input_box.history().is_empty()
+}
+
+/// Spaces left behind are no text to send, so the user's typing after them
+/// is theirs.
+#[test]
+fn a_blank_text_a_plugin_left_is_no_ones() {
+    let mut app = test_app();
+    write_as(&mut app, " ", named(only(Permission::Input)));
+    type_keys(&mut app, YOLO);
+    press_enter(&mut app).unwrap();
+    assert!(app.permissions.is_yolo());
+}
+
+/// Switching chats changes no text, so it needs no `input`. The draft that
+/// comes back keeps the writers it left with, and the plugin that switched is
+/// not one of them.
+#[test_case(false => None                                                    ; "a_draft_the_user_typed")]
+#[test_case(true  => Some(written(WRITER, WRITTEN_SHELL_LINE, &run_refused())) ; "a_draft_a_plugin_wrote")]
+fn a_draft_a_plugin_brought_back_keeps_its_writers(plugin_draft: bool) -> Option<String> {
+    let mut app = app_with_subagent();
+    if plugin_draft {
+        write_as(&mut app, SHELL_LINE, named(only(Permission::Input)));
+    } else {
+        type_keys(&mut app, SHELL_LINE);
+    }
+    app.run_builtin(BuiltinAction::NextChat);
+    let switcher = holding(&[]).owned_by(Arc::from(SECOND_WRITER));
+
+    let (handled, _) = app.run_action(BuiltinAction::PrevChat, Some(&switcher));
+    assert!(handled);
+    assert_eq!(app.input_box.buffer.value(), SHELL_LINE);
+    press_enter(&mut app).err()
+}
+
+/// A plugin is one writer, held to the grants of every write it made.
+#[test]
+fn a_plugin_that_wrote_twice_is_named_once() {
+    let mut app = test_app();
+    write_as(
+        &mut app,
+        "/comp",
+        named(holding(&[Permission::Input, Permission::Run])),
+    );
+    write_as(
+        &mut app,
+        COMPACT,
+        named(holding(&[Permission::Input, Permission::Net])),
+    );
+    let reason = Missing::Permission(Permission::Agent).refusal(COMPACT);
+    assert_eq!(
+        press_enter(&mut app).err(),
+        Some(written(WRITER, WRITTEN_COMMAND, &reason))
+    );
+}
+
+/// A plugin that sends the text answers for itself and for the plugin that
+/// wrote it.
+#[test]
+fn a_submit_needs_the_grants_of_the_writer_too() {
+    let mut app = test_app();
+    write_as(&mut app, SHELL_LINE, named(only(Permission::Input)));
+
+    let refused = app.submit_input(current_submit(&app, trusted()), TEST_AREA);
+    assert_eq!(
+        refused.err(),
+        Some(written(WRITER, WRITTEN_SHELL_LINE, &run_refused()))
+    );
+    assert_eq!(app.input_box.buffer.value(), SHELL_LINE);
+}
+
+/// What a line may do is weighed at Enter, so a vim mode moves, selects
+/// and edits on a `/` or `!` line with `input` alone.
+#[test_case("/c", vec![TextEdit { start: 2, stop: 2, text: "ompact".into() }], "/compact" ; "an_edit_on_a_command")]
+#[test_case("!x", vec![TextEdit { start: 1, stop: 2, text: "ls".into() }],     "!ls"      ; "an_edit_on_a_shell_line")]
+#[test_case("/c", Vec::new(),                                                  "/c"       ; "a_move_on_a_command")]
+#[test_case("!x", Vec::new(),                                                  "!x"       ; "a_move_on_a_shell_line")]
+fn a_plugin_with_input_edits_any_line(typed: &str, edits: Vec<TextEdit>, left: &str) {
+    let mut app = test_app();
+    type_keys(&mut app, typed);
+    let edit = InputEdit {
+        edits,
+        cursor: Some(0),
+        anchor: Some(1),
+        caller: only(Permission::Input),
+        ..planned_edit(&app, 0, 0, "")
+    };
+    apply_edit(&mut app, edit).unwrap();
+    let buffer = &app.input_box.buffer;
+    assert_eq!(
+        (buffer.value(), buffer.cursor_byte(), buffer.anchor()),
+        (left, 0, Some(1))
+    );
+    assert_eq!(app.status_bar.flash_text(), None);
+}
+
+/// Marks alone leave the selection where it is, the way `input_decorate`
+/// does.
+#[test]
+fn marks_alone_keep_the_selection() {
+    let mut app = test_app();
+    type_keys(&mut app, PLAIN_LINE);
+    let select = InputEdit {
+        edits: Vec::new(),
+        cursor: Some(0),
+        anchor: Some(3),
+        ..planned_edit(&app, 0, 0, "")
+    };
+    apply_edit(&mut app, select).unwrap();
+    let marks = InputEdit {
+        edits: Vec::new(),
+        caller: holding(&[]),
+        marks: Some(InputMarks {
+            ns: EDIT_PLUGIN.into(),
+            marks: Vec::new(),
+        }),
+        ..planned_edit(&app, 0, 0, "")
+    };
+    apply_edit(&mut app, marks).unwrap();
+    assert_eq!(app.input_box.buffer.anchor(), Some(3));
+}
+
+fn sent_a_shell_line(app: &mut App) {
+    app.input_box.set_input(SHELL_LINE);
+    app.input_box.submit();
+}
+
+fn deleted_the_bang(app: &mut App) {
+    type_keys(app, SHELL_LINE);
+    app.update(Msg::Key(key(KeyCode::Home)));
+    app.update(Msg::Key(key(KeyCode::Delete)));
+}
+
+/// "x!ls" with the "x" selected, which a new line would take the place of.
+fn selected_the_words_before(app: &mut App) {
+    type_keys(app, "x");
+    type_keys(app, SHELL_LINE);
+    let select = InputEdit {
+        edits: Vec::new(),
+        cursor: Some(0),
+        anchor: Some(1),
+        ..planned_edit(app, 0, 0, "")
+    };
+    apply_edit(app, select).unwrap();
+}
+
+/// The text an editing built-in leaves is the plugin's that ran it, like
+/// an edit, so a recall or an undo cannot set up a `!` line for the
+/// user's next Enter. Run by the user it stays theirs.
+#[test_case(BuiltinAction::HistoryPrev, sent_a_shell_line,         true  ; "a_recall_by_a_plugin")]
+#[test_case(BuiltinAction::Undo,        deleted_the_bang,          true  ; "an_undo_by_a_plugin")]
+#[test_case(BuiltinAction::Newline,     selected_the_words_before, true  ; "a_newline_by_a_plugin")]
+#[test_case(BuiltinAction::Undo,        deleted_the_bang,          false ; "an_undo_by_the_user")]
+fn a_shell_line_a_builtin_left(action: BuiltinAction, setup: fn(&mut App), by_plugin: bool) {
+    let (_tmp, _dir, _writer, mut app) = tempdir_app();
+    setup(&mut app);
+    let caller = named(only(Permission::Input));
+
+    let (handled, _) = app.run_action(action, by_plugin.then_some(&caller));
+    assert!(handled);
+    assert_eq!(app.input_box.buffer.value().trim(), SHELL_LINE);
+    let refusal = written(WRITER, WRITTEN_SHELL_LINE, &run_refused());
+    assert_eq!(press_enter(&mut app).err(), by_plugin.then_some(refusal));
+}
+
+/// A draft goes to disk with what its writers held as far as it can be
+/// vouched for, `agent` when each of them held it and nothing otherwise.
+#[test_case(only(Permission::Input)                       => Some(StoredWriters::Unknown) ; "without_agent")]
+#[test_case(holding(&[Permission::Input, Permission::Agent, Permission::SessionWrite]) => Some(StoredWriters::Agent) ; "with_what_a_prompt_takes")]
+fn a_draft_a_plugin_wrote_goes_to_disk(writer: PluginReach) -> Option<StoredWriters> {
+    let (_tmp, _dir, _writer, mut app) = tempdir_app();
+    write_as(&mut app, SHELL_LINE, named(writer));
+    app.checkpoint();
+    app.state.session.meta.input_draft_writers
+}
+
+/// A draft read back from disk comes back as written by a plugin with no
+/// name that holds what the disk kept.
+#[test_case(StoredWriters::Agent,   COMPACT_LINE => Ok(())                                                                          ; "a_turn_writer_runs_a_command_that_starts_turns")]
+#[test_case(StoredWriters::Agent,   YOLO         => Err(written(UNKNOWN_WRITER, WRITTEN_COMMAND, &user_only(YOLO)))                ; "a_turn_writer_leaves_user_only_commands")]
+#[test_case(StoredWriters::Unknown, COMPACT_LINE => Err(written(UNKNOWN_WRITER, WRITTEN_COMMAND, &Missing::Permission(Permission::Agent).refusal(COMPACT))) ; "an_unknown_writer_holds_nothing")]
+#[test_case(StoredWriters::Unknown, SHELL_LINE   => Err(written(UNKNOWN_WRITER, WRITTEN_SHELL_LINE, &run_refused()))              ; "an_unknown_writer_runs_no_shell_line")]
+#[test_case(StoredWriters::Unknown, PLAIN_LINE   => Err(written(UNKNOWN_WRITER, WRITTEN_MESSAGE, &message_refused()))             ; "an_unknown_writer_sends_no_message")]
+#[test_case(StoredWriters::Agent,   PLAIN_LINE   => Ok(())                                                                          ; "a_turn_writer_sends_a_message")]
+fn enter_on_a_restored_draft(writers: StoredWriters, text: &str) -> Result<(), String> {
+    let (_tmp, _dir, _writer, mut app) = tempdir_app();
+    let meta = &mut app.state.session_mut().meta;
+    meta.input_draft = Some(text.into());
+    meta.input_draft_writers = Some(writers);
+    app.restore_display();
+    assert_eq!(app.input_box.buffer.value(), text);
+    press_enter(&mut app)
+}
+
+const PARTIAL_YOLO: &str = "/yol";
+const COMPACT_LINE: &str = "/compact keep the tests";
+const MCP_PROMPT: &str = "srv:review";
+const MCP_PROMPT_TURN: &str = "/srv:review x";
+
+fn with_mcp_prompt(app: &mut App) {
+    app.command_palette = CommandPalette::new(
+        Arc::from([]),
+        McpSnapshotReader::from_snapshot(McpSnapshot {
+            infos: vec![],
+            prompts: vec![McpPromptInfo {
+                display_name: MCP_PROMPT.into(),
+                qualified_name: MCP_PROMPT.replace(':', "/"),
+                description: String::new(),
+                arguments: vec![McpPromptArg {
+                    name: "target".into(),
+                    description: String::new(),
+                    required: false,
+                }],
+            }],
+            pids: vec![],
+            generation: 0,
+        }),
+        LuaCommandReader::empty(),
+    );
+}
+
+/// Every user turn was sent by the user or by a plugin that could start
+/// turns. So a rewound turn runs a command that starts turns, and leaves a
+/// user-only one, also one the palette matches loosely, to the user.
+#[test_case(MCP_PROMPT_TURN => Ok(())                                                              ; "an_mcp_prompt")]
+#[test_case(COMPACT_LINE    => Ok(())                                                              ; "compact")]
+#[test_case(EXIT_WORD       => Ok(())                                                              ; "exit")]
+#[test_case(YOLO            => Err(written(UNKNOWN_WRITER, WRITTEN_COMMAND, &user_only(YOLO)))     ; "a_user_only_command")]
+#[test_case(PARTIAL_YOLO    => Err(written(UNKNOWN_WRITER, WRITTEN_COMMAND, &user_only(YOLO)))     ; "a_prefix_of_a_user_only_command")]
+#[test_case(SHELL_LINE      => Err(written(UNKNOWN_WRITER, WRITTEN_SHELL_LINE, &run_refused()))   ; "a_shell_line")]
+fn enter_on_a_rewound_turn(text: &str) -> Result<(), String> {
+    let mut app = build_rewind_app();
+    with_mcp_prompt(&mut app);
+    app.rewind_to(rewind_to_prompt(&format!("\n\n{text}")));
+    let entered = press_enter(&mut app);
+    assert!(!app.permissions.is_yolo());
+    entered
+}
+
+#[test]
+fn a_rewound_message_is_the_users() {
+    let mut app = build_rewind_app();
+    app.rewind_to(rewind_to_prompt(PLAIN_LINE));
+    assert!(app.input_box.buffer.writers().is_empty());
+}
+
+#[test_case(SHELL_LINE      => Some(StoredWriters::Agent) ; "a_shell_line")]
+#[test_case(MCP_PROMPT_TURN => Some(StoredWriters::Agent) ; "a_command")]
+#[test_case(EXIT_WORD       => Some(StoredWriters::Agent) ; "exit")]
+#[test_case(PLAIN_LINE      => None                       ; "a_message")]
+fn a_forked_turn_keeps_its_writers(text: &str) -> Option<StoredWriters> {
+    let mut app = test_app();
+    seed_rewind_session(app.state.session_mut());
+    let fork = opened_fork(app.fork_to(rewind_to_prompt(text)));
+    fork.meta.input_draft_writers
+}
+
+/// `init.lua` with no `plugin.toml` next to it holds no grants, so its edit
+/// raises before it reaches the UI, saying where to grant `input`.
+#[test]
+fn an_edit_without_a_manifest_says_where_to_grant_input() {
+    let host = new_host();
+    host.load_source_with_permissions(USER_CONFIG, NO_GRANTS_EDIT, PluginPermissions::denied())
+        .unwrap();
+    let (mut app, ui) = hosted_app(&host);
+
+    app.update(Msg::Key(KeyEvent::new(
+        KeyCode::Char('x'),
+        KeyModifiers::CONTROL,
+    )));
+    let asked = serve_handler(&mut app, &ui).0;
+    let [refusal] = &asked[..] else {
+        panic!("the edit never reached the UI, only the flash did: {asked:?}");
+    };
+    assert!(
+        refusal.contains(Permission::Input.manifest_key()) && refusal.contains(PLUGIN_MANIFEST),
+        "{refusal}"
+    );
+    assert_eq!(app.input_box.buffer.value(), "");
+}
+
+const GHOST_PLUGIN: &str = r#"
+maki.api.create_autocmd("InputChanged", {
+  callback = function(ev)
+    maki.ui.input_decorate({
+      ns = "ghost",
+      marks = { { start = ev.data.cursor, virt_text = { { "complete this", "dim" } }, virt_text_pos = "inline" } },
+      version = ev.data.version,
+      session_id = ev.data.session_id,
+    })
+  end,
+})
+"#;
+const GHOST_PLUGIN_NAME: &str = "ghost";
+const GHOST: &str = "complete this";
+const DECORATE_NEVER_CAME: &str = "the plugin never pushed its marks";
+const UNLOAD_NEVER_CAME: &str = "the UI never heard of the unload";
+
+/// Plays the event loop until the plugin pushes marks, and answers them.
+fn serve_decorate(app: &mut App, ui: &flume::Receiver<UiAction>) -> serde_json::Value {
+    loop {
+        if let UiAction::Input {
+            req: InputRequest::Decorate(req),
+            reply_tx,
+        } = ui.recv_timeout(HANDLER_TIMEOUT).expect(DECORATE_NEVER_CAME)
+        {
+            let reply = app.decorate_input(req);
+            let _ = reply_tx.send(reply.clone());
+            return reply.unwrap();
+        }
+    }
+}
+
+fn assert_one_ghost_after(app: &mut App, typed: &str) {
+    let screen = rendered(app);
+    assert_eq!(screen.matches(GHOST).count(), 1, "{screen}");
+    assert!(screen.contains(&format!("{typed}{GHOST}")), "{screen}");
+}
+
+/// The plugin hears about the text a frame late, and the user keeps typing
+/// while it works. Still, no frame should show the ghost anywhere but at the
+/// caret. In the end only the unload can take it away, because no edit ever
+/// drops a point mark.
+#[test]
+fn ghost_text_follows_typing_and_leaves_with_its_plugin() {
+    let (host, mut app, ui) = plugin_app(GHOST_PLUGIN_NAME, GHOST_PLUGIN);
+
+    type_keys(&mut app, "ab");
+    let _ = app.tick();
+    type_keys(&mut app, "c");
+    let reply = serve_decorate(&mut app, &ui);
+    assert_eq!(reply["version"], app.input_box.buffer.version());
+    assert_one_ghost_after(&mut app, "abc");
+
+    type_keys(&mut app, "d");
+    assert_one_ghost_after(&mut app, "abcd");
+    let _ = app.tick();
+    serve_decorate(&mut app, &ui);
+    assert_one_ghost_after(&mut app, "abcd");
+
+    host.unload(GHOST_PLUGIN_NAME).unwrap();
+    loop {
+        if let UiAction::PluginUnloaded(plugin) =
+            ui.recv_timeout(HANDLER_TIMEOUT).expect(UNLOAD_NEVER_CAME)
+        {
+            app.clear_plugin_marks(&plugin);
+            break;
+        }
+    }
+    let screen = rendered(&mut app);
+    assert!(!screen.contains(GHOST), "{screen}");
+}
+
+const COLLAPSE_PLUGIN_NAME: &str = "collapse";
+const COLLAPSED_PASTE_PLUGIN: &str = r#"
+maki.keymap.set("i", "<Paste>", function(ev)
+  local st = ev.input
+  maki.ui.input_edit({
+    start = st.cursor, stop = st.cursor, text = ev.text,
+    ns = "paste",
+    marks = { { start = st.cursor, stop = st.cursor + #ev.text, conceal = "[3 lines]", atomic = true } },
+    version = st.version, session_id = st.session_id,
+  })
+end)
+"#;
+const PASTED_WORD: &str = "pasted";
+const PASTED_LINES: &str = "pasted 1\npasted 2\npasted 3";
+const PASTE_CHIP: &str = "see [3 lines]";
+
+/// The text and its chip come in one request, so the first frame that could
+/// show the raw lines shows the chip instead.
+#[test]
+fn a_collapsed_paste_shows_its_chip_in_the_first_frame() {
+    let (_host, mut app, ui) = plugin_app(COLLAPSE_PLUGIN_NAME, COLLAPSED_PASTE_PLUGIN);
+    type_keys(&mut app, "see ");
+
+    app.update(Msg::Paste(PASTED_LINES.into()));
+    assert_eq!(serve_handler(&mut app, &ui).0, [ASKED_EDIT]);
+    let screen = rendered(&mut app);
+    assert!(screen.contains(PASTE_CHIP), "{screen}");
+    assert!(!screen.contains(PASTED_WORD), "{screen}");
+    assert_eq!(app.input_box.buffer.value(), format!("see {PASTED_LINES}"));
+}
+
+/// `ev.text` comes in cleaned, so a chip counted over it covers exactly the
+/// paste and never the user's text after it.
+#[test]
+fn a_paste_chip_counted_over_ev_text_covers_exactly_the_paste() {
+    let (_host, mut app, ui) = plugin_app(COLLAPSE_PLUGIN_NAME, COLLAPSED_PASTE_PLUGIN);
+    let typed = "see ";
+    type_keys(&mut app, typed);
+
+    app.update(Msg::Paste(TABBED_PASTE.into()));
+    serve_handler(&mut app, &ui);
+    let landed = format!("a{TAB_SPACES}b\nc");
+    let buffer = &app.input_box.buffer;
+    assert_eq!(buffer.value(), format!("{typed}{landed}"));
+    let chips: Vec<_> = buffer
+        .marks()
+        .touching(0..=usize::MAX)
+        .map(|mark| mark.bytes)
+        .collect();
+    let paste = typed.len()..typed.len() + landed.len();
+    assert_eq!(chips, [paste]);
+}
+
+const BURST_PLUGIN: &str = "burst";
+const BURST_BOUND: char = 'x';
+const BURST_KEYS: usize = 100;
+const BURST_PATTERN: &str = "abxcdxxe fx";
+const BURST_EDIT: &str = r#"
+    local st = ev.input
+    maki.ui.input_edit({
+        start = st.cursor, stop = st.cursor, text = "X",
+        version = st.version, session_id = st.session_id,
+    })"#;
+const BURST_EDIT_THEN_RAISE: &str = r#"
+    local st = ev.input
+    maki.ui.input_edit({
+        start = st.cursor, stop = st.cursor, text = "X",
+        version = st.version, session_id = st.session_id,
+    })
+    error("boom")"#;
+
+/// Every key is typed before the first handler gets an answer, so each
+/// handler is still at work while the keys behind it pile up. A key lost,
+/// doubled or swapped shows in the text, a hold left behind keeps the last
+/// key out, and a deadlock trips the serve timeout.
+#[test_case(BURST_EDIT, "X" ; "edits")]
+#[test_case(BURST_EDIT_THEN_RAISE, "X" ; "edits_then_raises")]
+#[test_case("ev.fallback()", "x" ; "falls_back")]
+#[test_case("", "" ; "spends_the_key")]
+fn a_burst_through_slow_handlers_lands_in_order(body: &str, bound_lands_as: &str) {
+    let (_host, mut app, ui) = plugin_app(
+        BURST_PLUGIN,
+        &format!(r#"maki.keymap.set("i", "{BURST_BOUND}", function(ev) {body} end)"#),
+    );
+    let typed: String = BURST_PATTERN.chars().cycle().take(BURST_KEYS).collect();
+
+    type_keys(&mut app, &typed);
+    for _ in typed.matches(BURST_BOUND) {
+        serve_handler(&mut app, &ui);
+    }
+    type_keys(&mut app, "z");
+
+    let expected = typed.replace(BURST_BOUND, bound_lands_as);
+    assert_eq!(app.input_box.buffer.value(), format!("{expected}z"));
+}
+
+const EDITED_FLASH: &str = "edited";
+const SUBMIT_EDITED: &str =
+    "maki.ui.input_submit({ version = edited.version, session_id = st.session_id })";
+
+/// Whatever the handler did before its fallback lands first, and the keys
+/// typed behind it come after both, so none of them is sent. The fallback
+/// never sends what the handler wrote, the submit does.
+#[test_case("", &[], "hi!next" ; "the_fallback_sends_nothing")]
+#[test_case(SUBMIT_EDITED, &["hi!"], "next" ; "the_submit_sends_and_the_fallback_finds_nothing")]
+fn a_handler_edits_and_falls_back_before_the_keys_behind_it(
+    submit: &str,
+    sent: &[&str],
+    left: &str,
+) {
+    const TYPED_BEHIND: &str = "next";
+    let (_host, mut app, ui) = plugin_app(
+        "shout",
+        &format!(
+            r#"
+            maki.keymap.set("i", "<CR>", function(ev)
+                local st = ev.input
+                local edited = maki.ui.input_edit({{
+                    start = #st.text, stop = #st.text, text = "!",
+                    version = st.version, session_id = st.session_id,
+                }})
+                maki.ui.flash("{EDITED_FLASH}")
+                {submit}
+                ev.fallback()
+            end)
+            "#
+        ),
+    );
+    type_keys(&mut app, "hi");
+
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    type_keys(&mut app, TYPED_BEHIND);
+    let (asked, actions) = serve_handler(&mut app, &ui);
+
+    assert_eq!(asked, [ASKED_EDIT, EDITED_FLASH, ASKED_FALLBACK]);
+    let sends: Vec<_> = actions
+        .iter()
+        .filter_map(|a| match a {
+            Action::SendMessage(s) => Some(s.message.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(sends, sent);
+    assert_eq!(app.input_box.buffer.value(), left);
+}
+
+/// The handler moves the keyboard from tab to tab before it is done. The
+/// keys typed in between were all aimed at wherever it ended up, so they
+/// land there once, and every tab it passed through is left with nothing.
+#[test]
+fn held_keys_hop_tabs_with_the_handler_and_land_once() {
+    let (mut first, probe) = app_binding(KeyCode::Tab);
+    let mut second = test_app();
+    second.keymap_reader = first.keymap_reader.clone();
+
+    let tab = press_bound(&mut first, &probe, KeyCode::Tab);
+    type_keys(&mut first, "a");
+    first.hand_typeahead_to(&mut second);
+    type_keys(&mut second, "b");
+    second.hand_typeahead_to(&mut first);
+    type_keys(&mut first, "c");
+    first.hand_typeahead_to(&mut second);
+    first.keybind_done(tab.id());
+    let _ = first.tick();
+    assert_eq!(second.input_box.buffer.value(), "", "still held");
+
+    second.keybind_done(tab.id());
+    let _ = second.tick();
+    type_keys(&mut first, "d");
+
+    assert_eq!(second.input_box.buffer.value(), "abc");
+    assert_eq!(first.input_box.buffer.value(), "d");
+}
+
+const BOLD_PLUGIN: &str = r#"
+maki.keymap.set("i", "<C-b>", function(ev)
+  local st = ev.input
+  if not st.anchor then return ev.fallback() end
+  local s, e = math.min(st.anchor, st.cursor), math.max(st.anchor, st.cursor)
+  maki.ui.input_edit({
+    edits = { { start = s, stop = s, text = "**" }, { start = e, stop = e, text = "**" } },
+    cursor = e + 2, anchor = s + 2,
+    version = st.version, session_id = st.session_id,
+  })
+end)
+"#;
+const UNBOLDED: &str = "make it bold";
+const BOLDED: &str = "make it **bold**";
+const BOLD_WORD: &str = "bold";
+
+/// Both `**` land as one version, the word stays selected for the next
+/// keystroke, and one undo takes the wrap back with the selection it had.
+#[test]
+fn ctrl_b_wraps_the_selection_in_one_step() {
+    let (_host, mut app, ui) = plugin_app("bold", BOLD_PLUGIN);
+    type_keys(&mut app, UNBOLDED);
+    for _ in 0..BOLD_WORD.len() {
+        app.update(Msg::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT)));
+    }
+    let version = app.input_box.buffer.version();
+
+    app.update(Msg::Key(KeyEvent::new(
+        KeyCode::Char('b'),
+        KeyModifiers::CONTROL,
+    )));
+    assert_eq!(serve_handler(&mut app, &ui).0, [ASKED_EDIT]);
+    assert_eq!(app.input_box.buffer.value(), BOLDED);
+    assert_eq!(app.input_box.buffer.version(), version + 1);
+    assert_eq!(
+        app.input_box.take_selected_text().as_deref(),
+        Some(BOLD_WORD)
+    );
+
+    app.update(Msg::Key(kb::UNDO.to_key_event()));
+    assert_eq!(app.input_box.buffer.value(), UNBOLDED);
+    assert_eq!(
+        app.input_box.take_selected_text().as_deref(),
+        Some(BOLD_WORD)
+    );
+}
+
+const DRAFT: &str = "ls -la";
+
+/// A `!` key that puts the cursor at the start of the input, or selects the
+/// first two bytes, before it hands the key back. The user's `!` would
+/// land there and make their draft a shell line.
+fn steering_bang(anchor: &str) -> String {
+    format!(
+        r#"
+maki.keymap.set("i", "!", function(ev)
+    pcall(maki.ui.input_edit, {{
+        edits = {{}}, cursor = 0, anchor = {anchor},
+        version = ev.input.version, session_id = ev.input.session_id,
+    }})
+    ev.fallback()
+end)
+"#
+    )
+}
+
+/// Without `input` the move raises, so the key lands where the user
+/// typed. With it the caret moved since the press, so the key is dropped
+/// instead of landing somewhere the user never aimed it.
+#[test_case("nil", &["session_read"],          "ls -la!" ; "a_cursor_moved_without_input")]
+#[test_case("nil", &["input", "session_read"], DRAFT     ; "a_cursor_moved_with_input")]
+#[test_case("2",   &["input", "session_read"], DRAFT     ; "a_selection_made_with_input")]
+fn a_fallback_lands_where_the_user_typed(anchor: &str, grants: &[&str], left: &str) {
+    let host = granted_host(&steering_bang(anchor), grants);
+    let (mut app, ui) = hosted_app(&host);
+    type_keys(&mut app, DRAFT);
+
+    app.update(Msg::Key(key(KeyCode::Char('!'))));
+    serve_handler(&mut app, &ui);
+
+    assert_eq!(app.input_box.buffer.value(), left);
+}
+
+const PRICED_OWNER: &str = "owner";
+/// An action that writes a `!` in front of the input. Its owner holds every
+/// grant, `run` included, and its price leaves `run` out.
+const BANG_ACTION: &str = r#"
+maki.api.register_action("bang", function()
+    local st = maki.ui.input()
+    local _, err = maki.ui.input_edit({
+        start = 0, stop = 0, text = "!",
+        version = st.version, session_id = st.session_id,
+    })
+    return err == nil
+end, { capability = { "input", "session_read", "agent", "session_write" } })
+"#;
+const BANG_CALLER: &str = r#"
+maki.keymap.set("i", "<C-x>", function()
+    maki.ui.flash(tostring(maki.ui.action("owner.bang")))
+end)
+"#;
+
+/// The callback holds only the price of its action, also in the UI. The `!`
+/// it writes is held to that price, so a caller holding `run` itself still
+/// cannot make Enter run it.
+#[test]
+fn an_action_writes_the_input_with_its_price_alone() {
+    let host = new_host();
+    host.load_source(PRICED_OWNER, BANG_ACTION).unwrap();
+    host.load_source(USER_CONFIG, BANG_CALLER).unwrap();
+    let (mut app, ui) = hosted_app(&host);
+    type_keys(&mut app, DRAFT);
+
+    app.update(Msg::Key(KeyEvent::new(
+        KeyCode::Char('x'),
+        KeyModifiers::CONTROL,
+    )));
+
+    assert_eq!(serve_handler(&mut app, &ui).0, [ASKED_EDIT, "true"]);
+    assert_eq!(app.input_box.buffer.value(), format!("!{DRAFT}"));
+    assert_eq!(
+        press_enter(&mut app).err(),
+        Some(written(PRICED_OWNER, WRITTEN_SHELL_LINE, &run_refused()))
+    );
+}
+
+/// A source for `$` that answers at once, so the real completion popup opens
+/// without walking a tree.
+const SKILL_SOURCE_PLUGIN: &str = r#"
+maki.api.set_slot("completion.sources", function(prev, list)
+  table.insert(list, {
+    name = "skills",
+    trigger = "$",
+    complete = function() return { { text = "$review" } } end,
+  })
+  return prev(list)
+end)
+"#;
+const USER_CONFIG: &str = "global/init.lua";
+/// The `<Tab>` a user composes in `init.lua`. `ghost.accept` belongs to a
+/// plugin that is not loaded.
+const TAB_COMPOSITION: &str = r#"
+maki.keymap.set("i", "<Tab>", function(ev)
+  if maki.ui.action("completion.accept") then return end
+  if maki.ui.action("ghost.accept") then return end
+  ev.fallback()
+end)
+"#;
+const POPUP_NEVER_SHOWN: &str = "the completion popup never came up";
+
+/// Plays the event loop until the completion popup is on screen with its
+/// rows, which it shows only after painting them.
+fn serve_until_popup(ui: &flume::Receiver<UiAction>) -> flume::Receiver<WinCommand> {
+    loop {
+        match ui.recv_timeout(HANDLER_TIMEOUT).expect(POPUP_NEVER_SHOWN) {
+            UiAction::Session { reply_tx, .. } => {
+                let _ = reply_tx.send(Ok(serde_json::json!({ "cwd": "/" })));
+            }
+            UiAction::OpenWin { cmd_rx, .. } => loop {
+                let cmd = cmd_rx
+                    .recv_timeout(HANDLER_TIMEOUT)
+                    .expect(POPUP_NEVER_SHOWN);
+                if matches!(cmd, WinCommand::SetVisible(true)) {
+                    return cmd_rx;
+                }
+            },
+            _ => {}
+        }
+    }
+}
+
+/// `completion.accept` asks its callers for all it uses, sending what it
+/// wrote included. A caller short of that is refused, even one that may
+/// read files, and the key falls back.
+#[test_case(&["fs_read", "input", "session_read", "agent", "session_write"], None ; "the_full_price")]
+#[test_case(&["fs_read", "session_read", "agent", "session_write"], Some(Permission::Input) ; "without_input")]
+#[test_case(&["fs_read", "input", "session_read", "session_write"], Some(Permission::Agent) ; "without_agent")]
+fn tab_composed_in_init_lua_accepts_a_completion_or_falls_back(
+    grants: &[&str],
+    missing: Option<Permission>,
+) {
+    let mut host = new_host();
+    host.load_builtins(&PluginsConfig {
+        enabled: true,
+        names: vec!["completion".into()],
+        ..PluginsConfig::default()
+    })
+    .unwrap();
+    host.load_source("skills", SKILL_SOURCE_PLUGIN).unwrap();
+    host.load_source_with_permissions(
+        USER_CONFIG,
+        TAB_COMPOSITION,
+        PluginPermissions::from_approved(grants.iter().copied()),
+    )
+    .unwrap();
+    let (mut app, ui) = hosted_app(&host);
+
+    type_keys(&mut app, "$re");
+    let _ = app.tick();
+    let _popup = serve_until_popup(&ui);
+    let mode = app.state.mode;
+    app.update(Msg::Key(key(KeyCode::Tab)));
+    let asked = serve_handler(&mut app, &ui).0;
+
+    match missing {
+        None => {
+            assert_eq!(asked, [ASKED_EDIT]);
+            assert_eq!(app.input_box.buffer.value(), "$review ");
+            app.update(Msg::Key(key(KeyCode::Tab)));
+            assert_eq!(serve_handler(&mut app, &ui).0, [ASKED_FALLBACK]);
+            press_enter(&mut app).unwrap();
+        }
+        Some(perm) => {
+            let refusal = Missing::Permission(perm).refusal("completion.accept");
+            assert_eq!(asked, [refusal.as_str(), ASKED_FALLBACK]);
+            assert_eq!(app.input_box.buffer.value(), "$re");
+        }
+    }
+    assert_ne!(app.state.mode, mode, "the built-in Tab toggled the mode");
+}
+
+/// A vim plugin's `u`. In normal mode the key itself would never edit, so
+/// only the action can, and its answer travels back to the handler.
+const UNDO_PLUGIN: &str = r#"
+maki.keymap.set("n", "u", function()
+  maki.ui.flash(tostring(maki.ui.action("undo")))
+end)
+"#;
+
+#[test]
+fn a_builtin_action_answers_the_handler_in_normal_mode() {
+    let (_host, mut app, ui) = plugin_app("vim", UNDO_PLUGIN);
+    type_keys(&mut app, "ab");
+    set_mode(&app.keymap_reader, InputMode::Normal);
+
+    app.update(Msg::Key(key(KeyCode::Char('u'))));
+    assert_eq!(serve_handler(&mut app, &ui).0, ["true"]);
+    assert_eq!(app.input_box.buffer.value(), "");
+
+    app.update(Msg::Key(key(KeyCode::Char('u'))));
+    assert_eq!(serve_handler(&mut app, &ui).0, ["false"]);
+}
+
+#[test]
+fn input_actions_say_when_there_was_nothing_to_do() {
+    const SENT: &str = "sent";
+    const TYPED: &str = "ab";
+    const TYPED_LINE: &str = "ab\n";
+    let (_tmp, _dir, _writer, mut app) = tempdir_app();
+    app.input_box.set_input(SENT);
+    app.input_box.submit();
+    type_keys(&mut app, TYPED);
+
+    for (action, handled, value) in [
+        (BuiltinAction::Newline, true, TYPED_LINE),
+        (BuiltinAction::Undo, true, TYPED),
+        (BuiltinAction::Redo, true, TYPED_LINE),
+        (BuiltinAction::Redo, false, TYPED_LINE),
+        (BuiltinAction::HistoryPrev, true, SENT),
+        (BuiltinAction::HistoryPrev, false, SENT),
+        (BuiltinAction::HistoryNext, true, TYPED_LINE),
+        (BuiltinAction::HistoryNext, false, TYPED_LINE),
+    ] {
+        let answered = app.run_action(action, None).0;
+        assert_eq!(
+            (answered, app.input_box.buffer.value()),
+            (handled, value),
+            "{action:?}"
+        );
+    }
 }
 
 const EXPECT_NAMEABLE: &str = "the test named a key no notation spells";
@@ -5866,7 +8446,7 @@ const HIDDEN_DRAFT: &str = "half a thought";
 #[test_case(KeyCode::Backspace ; "backspace")]
 fn a_key_no_notation_names_never_reaches_the_chat_behind_a_focused_float(code: KeyCode) {
     let mut app = test_app();
-    app.input_box.set_input(HIDDEN_DRAFT.into());
+    app.input_box.set_input(HIDDEN_DRAFT);
     app.input_box.buffer.move_to_end();
     let mode = app.state.mode;
     let (event_tx, event_rx) = flume::bounded::<WinEvent>(8);
@@ -6051,6 +8631,10 @@ fn dead_host_override_falls_back_to_builtin() {
         app.help_modal.is_open(),
         "dead lua host must fall back to the built-in HELP handler"
     );
+    assert!(
+        !app.typeahead.holding(),
+        "no handler runs, so nothing may hold the keys after it"
+    );
 }
 
 #[test]
@@ -6169,7 +8753,7 @@ fn ctrl_c_closes_overlay_instead_of_quitting() {
 fn bash_prefix_overrides_mode() {
     let mut app = test_app();
 
-    app.input_box.set_input("! ls".into());
+    app.input_box.set_input("! ls");
     assert_eq!(&*app.mode_label().0, "[BASH]");
 
     app.update(Msg::Key(key(KeyCode::Tab)));
@@ -6179,7 +8763,7 @@ fn bash_prefix_overrides_mode() {
         "tab must not toggle while bash prefix present"
     );
 
-    app.input_box.set_input("ls".into());
+    app.input_box.set_input("ls");
     assert_eq!(&*app.mode_label().0, "[BUILD]");
 }
 
@@ -6584,8 +9168,7 @@ fn checkpoint_preserves_thinking_until_discovery_finishes(stored: StoredThinking
 #[test]
 fn model_change_fires_once_per_real_swap() {
     let (_tmp, _storage, _writer, mut app) = tempdir_app();
-    let (handle, probe) = maki_lua::test_support::probed_event_handle();
-    app.lua_event_handle = handle;
+    let probe = probe_events(&mut app);
     let before = app.state.model.spec();
 
     app.emit_model_change();
@@ -6613,8 +9196,7 @@ fn model_change_fires_once_per_real_swap() {
 #[test]
 fn loading_a_session_on_another_model_announces_the_swap() {
     let (_tmp, _storage, _writer, mut app) = tempdir_app();
-    let (handle, probe) = maki_lua::test_support::probed_event_handle();
-    app.lua_event_handle = handle;
+    let probe = probe_events(&mut app);
     let resolved = Model::from_spec(OPUS_SPEC).unwrap();
 
     app.apply_loaded_session(
@@ -6634,8 +9216,7 @@ fn loading_a_session_on_another_model_announces_the_swap() {
 #[test]
 fn input_change_fires_once_per_tick() {
     let mut app = test_app();
-    let (handle, probe) = maki_lua::test_support::probed_event_handle();
-    app.lua_event_handle = handle;
+    let probe = probe_events(&mut app);
 
     for c in "hi".chars() {
         app.update(Msg::Key(key(KeyCode::Char(c))));
@@ -6663,8 +9244,7 @@ fn input_change_fires_once_per_tick() {
 #[test]
 fn input_change_names_the_plugin_that_wrote_it() {
     let mut app = test_app();
-    let (handle, probe) = maki_lua::test_support::probed_event_handle();
-    app.lua_event_handle = handle;
+    let probe = probe_events(&mut app);
 
     let planned = planned_edit(&app, 0, 0, "hi");
     apply_edit(&mut app, planned).unwrap();
@@ -6681,8 +9261,7 @@ fn input_change_names_the_plugin_that_wrote_it() {
 #[test]
 fn a_frame_the_user_also_typed_into_names_nobody() {
     let mut app = test_app();
-    let (handle, probe) = maki_lua::test_support::probed_event_handle();
-    app.lua_event_handle = handle;
+    let probe = probe_events(&mut app);
 
     app.update(Msg::Key(key(KeyCode::Char('a'))));
     let planned = planned_edit(&app, 1, 1, "b");
@@ -6705,13 +9284,12 @@ fn a_frame_the_user_also_typed_into_names_nobody() {
 fn a_frame_two_plugins_wrote_names_nobody() {
     const OTHER_PLUGIN: &str = "snippets";
     let mut app = test_app();
-    let (handle, probe) = maki_lua::test_support::probed_event_handle();
-    app.lua_event_handle = handle;
+    let probe = probe_events(&mut app);
 
     let first = planned_edit(&app, 0, 0, "a");
     apply_edit(&mut app, first).unwrap();
     let second = InputEdit {
-        plugin: Arc::from(OTHER_PLUGIN),
+        caller: trusted().owned_by(Arc::from(OTHER_PLUGIN)),
         ..planned_edit(&app, 1, 1, "b")
     };
     apply_edit(&mut app, second).unwrap();
@@ -6730,10 +9308,9 @@ fn a_frame_two_plugins_wrote_names_nobody() {
 fn focusing_a_tab_announces_the_input_it_holds() {
     const FOCUSED_DRAFT: &str = "the other tab's draft";
     let mut app = test_app();
-    let (handle, probe) = maki_lua::test_support::probed_event_handle();
-    app.lua_event_handle = handle;
+    let probe = probe_events(&mut app);
 
-    app.input_box.set_input(FOCUSED_DRAFT.into());
+    app.input_box.set_input(FOCUSED_DRAFT);
     app.announce_input();
 
     let data = next_input_change(&probe).expect(INPUT_CHANGED_EVENT);
@@ -6761,10 +9338,9 @@ fn focusing_a_tab_announces_the_input_it_holds() {
 fn a_focus_switch_fires_one_input_change() {
     const RESTORED_DRAFT: &str = "the draft the switch restored";
     let mut app = test_app();
-    let (handle, probe) = maki_lua::test_support::probed_event_handle();
-    app.lua_event_handle = handle;
+    let probe = probe_events(&mut app);
 
-    app.input_box.set_input(RESTORED_DRAFT.into());
+    app.input_box.set_input(RESTORED_DRAFT);
     let _ = app.tick();
     app.announce_input();
 
@@ -6783,8 +9359,7 @@ fn a_focus_switch_fires_one_input_change() {
 #[test]
 fn resending_the_same_text_still_fires() {
     let mut app = test_app();
-    let (handle, probe) = maki_lua::test_support::probed_event_handle();
-    app.lua_event_handle = handle;
+    let probe = probe_events(&mut app);
 
     for c in "hi".chars() {
         app.update(Msg::Key(key(KeyCode::Char(c))));
@@ -6818,10 +9393,9 @@ fn resending_the_same_text_still_fires() {
 fn focusing_a_tab_holding_what_it_announced_fires_one_input_change() {
     const HELD_DRAFT: &str = "what this tab held while another was focused";
     let mut app = test_app();
-    let (handle, probe) = maki_lua::test_support::probed_event_handle();
-    app.lua_event_handle = handle;
+    let probe = probe_events(&mut app);
 
-    app.input_box.set_input(HELD_DRAFT.into());
+    app.input_box.set_input(HELD_DRAFT);
     let _ = app.tick();
     next_input_change(&probe).expect("the tab announced the draft while it was focused");
 
@@ -6850,8 +9424,7 @@ fn focusing_a_tab_holding_what_it_announced_fires_one_input_change() {
 fn a_history_recall_after_a_plugin_edit_names_nobody() {
     const SENT: &str = "sent a moment ago";
     let mut app = test_app();
-    let (handle, probe) = maki_lua::test_support::probed_event_handle();
-    app.lua_event_handle = handle;
+    let probe = probe_events(&mut app);
 
     for c in SENT.chars() {
         app.update(Msg::Key(key(KeyCode::Char(c))));
@@ -6874,7 +9447,7 @@ fn a_history_recall_after_a_plugin_edit_names_nobody() {
     );
 }
 
-fn next_input_change(probe: &maki_lua::test_support::RequestProbe) -> Option<serde_json::Value> {
+fn next_input_change(probe: &RequestProbe) -> Option<serde_json::Value> {
     while let Some((event, data)) = probe.try_recv_autocmd() {
         if event == INPUT_CHANGED_EVENT {
             return Some(data);
@@ -6889,8 +9462,7 @@ fn next_input_change(probe: &maki_lua::test_support::RequestProbe) -> Option<ser
 #[test]
 fn a_cursor_back_where_it_started_fires_nothing() {
     let mut app = test_app();
-    let (handle, probe) = maki_lua::test_support::probed_event_handle();
-    app.lua_event_handle = handle;
+    let probe = probe_events(&mut app);
 
     app.update(Msg::Key(key(KeyCode::Char('a'))));
     let _ = app.tick();
@@ -6910,8 +9482,7 @@ fn a_cursor_back_where_it_started_fires_nothing() {
 fn moving_the_cursor_alone_fires_a_cursor_only_change() {
     const MENTION: &str = "@src";
     let mut app = test_app();
-    let (handle, probe) = maki_lua::test_support::probed_event_handle();
-    app.lua_event_handle = handle;
+    let probe = probe_events(&mut app);
 
     for c in MENTION.chars() {
         app.update(Msg::Key(key(KeyCode::Char(c))));
@@ -6942,6 +9513,47 @@ fn moving_the_cursor_alone_fires_a_cursor_only_change() {
         None,
         "a frame that moved neither the caret nor the text stays silent"
     );
+}
+
+/// `Esc` drops a selection without moving the caret or the text, and a
+/// plugin drawing on the selection still has to hear it went.
+#[test]
+fn a_selection_alone_fires_a_cursor_only_change() {
+    let mut app = test_app();
+    let probe = probe_events(&mut app);
+    type_keys(&mut app, "ab");
+    let _ = app.tick();
+    next_input_change(&probe).expect(INPUT_CHANGED_EVENT);
+
+    app.update(Msg::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT)));
+    let _ = app.tick();
+    let data = next_input_change(&probe).expect(INPUT_CHANGED_EVENT);
+    assert_eq!(data["cursor"], 1);
+    assert_eq!(data["anchor"], 2);
+    assert_eq!(data["cursor_only"], true);
+
+    app.update(Msg::Key(key(KeyCode::Esc)));
+    let _ = app.tick();
+    let data = next_input_change(&probe).expect(INPUT_CHANGED_EVENT);
+    assert!(data["anchor"].is_null());
+    assert_eq!(data["cursor_only"], true);
+}
+
+/// A selection must not cost a turn's cancel a press: during a turn the `Esc`
+/// that drops it arms the cancel too. Idle it only drops it.
+#[test_case(Status::Idle,      None               ; "idle_only_deselects")]
+#[test_case(Status::Streaming, Some(FLASH_CANCEL) ; "streaming_also_arms_cancel")]
+fn esc_with_a_selection(status: Status, expected_flash: Option<&str>) {
+    let mut app = test_app();
+    type_keys(&mut app, "ab");
+    app.update(Msg::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT)));
+    app.status = status;
+    app.run_id = 1;
+
+    app.update(Msg::Key(key(KeyCode::Esc)));
+
+    assert_eq!(app.input_box.buffer.anchor(), None);
+    assert_eq!(app.status_bar.flash_text(), expected_flash);
 }
 
 /// What `model_state` reports has to parse back into the same state, or a
@@ -7467,8 +10079,8 @@ fn exit_in_subagent_chat_quits() {
 
 /// These change the text without a keypress, and `Enter` must still act on
 /// what the box shows.
-#[test_case(false, |app| app.input_box.set_input(HELP_COMMAND.into()), true ; "set_directly_opens_it")]
-#[test_case(true, |app| app.input_box.set_input(MAIN_DRAFT.into()), false ; "replaced_directly_closes_it")]
+#[test_case(false, |app| app.input_box.set_input(HELP_COMMAND), true ; "set_directly_opens_it")]
+#[test_case(true, |app| app.input_box.set_input(MAIN_DRAFT), false ; "replaced_directly_closes_it")]
 #[test_case(true, |app| { app.run_builtin(BuiltinAction::PrevChat); }, false ; "chat_switch_closes_it")]
 fn enter_acts_on_what_the_box_shows(open_first: bool, change: fn(&mut App), runs_command: bool) {
     let (mut app, _inbox) = app_with_subagent_inbox();
@@ -7864,8 +10476,7 @@ fn loading_a_session_stamps_its_restores_as_a_load_of_that_session() {
     stored
         .save(&SessionClaim::acquire(stored.id, &dir).unwrap(), &dir)
         .unwrap();
-    let (handle, probe) = maki_lua::test_support::probed_event_handle();
-    app.lua_event_handle = handle;
+    let probe = probe_events(&mut app);
     app.restore_event_tx = Some(maki_agent::EventSender::new(flume::unbounded().0, 0));
 
     load_session(&mut app, stored.id, &test_model());
@@ -7885,8 +10496,7 @@ fn loading_a_session_stamps_its_restores_as_a_load_of_that_session() {
 fn reset_session_stamps_the_new_main_chat_with_the_new_session() {
     let mut app = test_app();
     let previous = app.state.session.id;
-    let (handle, probe) = maki_lua::test_support::probed_event_handle();
-    app.lua_event_handle = handle;
+    let probe = probe_events(&mut app);
     app.restore_event_tx = Some(maki_agent::EventSender::new(flume::unbounded().0, 0));
     let (_, items) = crate::chat::history_to_display(
         &[
@@ -8131,8 +10741,7 @@ const RELOAD_ENDS_NOTHING: &str =
 fn loading_ends_the_previous_session_only_when_the_id_changes(same: bool) {
     let mut app = test_app();
     let previous = app.state.session.id;
-    let (handle, probe) = maki_lua::test_support::probed_event_handle();
-    app.lua_event_handle = handle;
+    let probe = probe_events(&mut app);
     // Reopening the session a tab holds shares its claim, as every holder in
     // one process must.
     let tab = if same {
@@ -8171,7 +10780,7 @@ fn load_session_persists_the_new_session_and_leaks_no_history_into_it() {
         .unwrap();
 
     let _live = attach_live_history(&mut app, vec![Message::user(LIVE_AGENT_TEXT.into())]);
-    app.input_box.set_input(UNSENT_DRAFT.into());
+    app.input_box.set_input(UNSENT_DRAFT);
     app.checkpoint();
     let (live_id, sent_revision) = (app.state.session.id, app.state.session.revision());
 
@@ -8186,7 +10795,7 @@ fn load_session_persists_the_new_session_and_leaks_no_history_into_it() {
     while session.revision() + 1 < sent_revision {
         session.set_title(format!("{BUMP_TITLE}{}", session.revision()));
     }
-    app.input_box.set_input(SWITCHED_DRAFT.into());
+    app.input_box.set_input(SWITCHED_DRAFT);
     app.checkpoint();
     assert_eq!(
         app.state.session.revision(),

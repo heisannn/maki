@@ -16,6 +16,7 @@ pub mod pool;
 const TOKEN_ALIASES: &[(&str, &str)] = &[("jsx", "js")];
 pub const TAB_SPACES: &str = "  ";
 const BLOCK_CACHE_MAX_BYTES: usize = 16 * 1024 * 1024;
+const MAX_HIGHLIGHT_PREFIX_BYTES: usize = 16 * 1024;
 
 /// Bat encodes ANSI palette semantics in the syntect alpha channel, and
 /// syntect passes the bytes through untouched. `a = 0` means `r` holds a
@@ -412,12 +413,25 @@ impl StyledSegment {
     }
 }
 
+fn bounded_prefix(prefix: &str) -> &str {
+    let start = prefix.len().saturating_sub(MAX_HIGHLIGHT_PREFIX_BYTES);
+    if start == 0 || prefix.as_bytes()[start - 1] == b'\n' {
+        return &prefix[start..];
+    }
+    // The byte cutoff may split UTF-8. A newline gives us both a character
+    // boundary and a line start without parsing the discarded context.
+    prefix.as_bytes()[start..]
+        .iter()
+        .position(|&byte| byte == b'\n')
+        .map_or("", |newline| &prefix[start + newline + 1..])
+}
+
+/// Prefix context is limited to the nearest lines that fit in 16 KiB.
+/// Parser state opened before that window cannot be reconstructed.
 pub fn highlight_code(lang: &str, code: &str, prefix: &str) -> Vec<Vec<StyledSegment>> {
     let mut hl = Highlighter::for_token(lang);
-    if !prefix.is_empty() {
-        for line in LinesWithEndings::from(prefix) {
-            hl.advance(line);
-        }
+    for line in LinesWithEndings::from(bounded_prefix(prefix)) {
+        hl.advance(line);
     }
     LinesWithEndings::from(code)
         .map(|raw| hl.highlight_line(raw))
@@ -652,6 +666,8 @@ mod tests {
     const RUST: &str = "rust";
     const PYTHON: &str = "python";
     const OPENS_A_STRING: &str = "x = '''";
+    const PREFIX_CODE: &str = "*/ let value = 1;";
+    const RECENT_COMMENT: &str = "/* recent comment\n";
 
     /// The theme and the block cache are process globals. Nextest gives every
     /// test its own process, `cargo test` does not, so tests that swap the theme
@@ -705,6 +721,42 @@ mod tests {
         let trailing = highlight_code("rust", "let x = 1;\n\n\n", "");
         assert_eq!(trailing.len(), 3);
         assert_eq!(segments_text(&trailing[1]), "");
+    }
+
+    #[test_case("x", "\nnearby\n", "nearby\n"; "nearest_line_after_oversized_line")]
+    #[test_case("x", "\none\ntwo\n", "one\ntwo\n"; "nearest_lines")]
+    #[test_case("x", "", ""; "oversized_unterminated_line")]
+    #[test_case("x", "\n", ""; "oversized_terminated_line")]
+    #[test_case("é", "\nx\n", "x\n"; "cutoff_inside_utf8")]
+    #[test_case("x", "\r\nnearby\r\n", "nearby\r\n"; "crlf_lines")]
+    fn prefix_budget_keeps_nearest_complete_lines(padding: &str, tail: &str, expected: &str) {
+        let prefix = format!("{}{tail}", padding.repeat(MAX_HIGHLIGHT_PREFIX_BYTES + 1));
+        assert_eq!(bounded_prefix(&prefix), expected);
+    }
+
+    #[test_case(""; "unterminated")]
+    #[test_case("\n"; "lf")]
+    #[test_case("\r\n"; "crlf")]
+    fn prefix_at_byte_limit_keeps_its_first_line(ending: &str) {
+        let exact = format!(
+            "{}{ending}",
+            "x".repeat(MAX_HIGHLIGHT_PREFIX_BYTES - ending.len())
+        );
+        assert_eq!(bounded_prefix(&exact), exact);
+        assert_eq!(bounded_prefix(&format!("discarded\n{exact}")), exact);
+    }
+
+    #[test_case(""; "discard_expired_context")]
+    #[test_case(RECENT_COMMENT; "retain_nearby_context")]
+    fn highlight_code_uses_only_the_bounded_prefix(recent: &str) {
+        let _globals = exclusive_globals();
+        let prefix = format!("/* {}\n{recent}", "x".repeat(MAX_HIGHLIGHT_PREFIX_BYTES));
+        let expected = highlight_code(RUST, PREFIX_CODE, recent);
+        assert_eq!(highlight_code(RUST, PREFIX_CODE, &prefix), expected);
+        assert_ne!(
+            highlight_code(RUST, PREFIX_CODE, RECENT_COMMENT),
+            highlight_code(RUST, PREFIX_CODE, "")
+        );
     }
 
     #[test]

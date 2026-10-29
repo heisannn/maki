@@ -347,6 +347,10 @@ impl FilePickerModal {
 }
 
 impl Overlay for FilePickerModal {
+    fn is_prompting(&self) -> bool {
+        false
+    }
+
     fn is_open(&self) -> bool {
         self.is_open()
     }
@@ -467,7 +471,7 @@ fn reparse_pattern(s: &mut Session) {
     let query = s.search.value();
     s.nucleo
         .pattern
-        .reparse(0, &query, CaseMatching::Smart, Normalization::Smart, false);
+        .reparse(0, query, CaseMatching::Smart, Normalization::Smart, false);
     s.selected = 0;
     s.scroll_offset = 0;
     s.reselect = None;
@@ -602,7 +606,7 @@ fn render_list(frame: &mut Frame, area: Rect, s: &Session) {
 fn render_search(frame: &mut Frame, area: Rect, s: &Session) {
     let t = theme::current();
     let query = s.search.value();
-    let cursor_byte = TextBuffer::char_to_byte(&query, s.search.x());
+    let cursor_byte = TextBuffer::char_to_byte(query, s.search.x());
     let (before, rest) = query.split_at(cursor_byte);
     let mut chars = rest.chars();
     let cursor_char = chars.next().unwrap_or(' ');
