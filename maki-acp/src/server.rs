@@ -9,11 +9,11 @@ use std::time::Duration;
 use agent_client_protocol_schema::v1::{
     AgentNotification, AgentRequest, AgentResponse, AvailableCommandsUpdate, ConfigOptionUpdate,
     ContentBlock, CurrentModeUpdate, EmbeddedResourceResource, Error as AcpError,
-    ForkSessionRequest, ImageContent, InitializeRequest, JsonRpcMessage, ListSessionsRequest, ListSessionsResponse,
-    LoadSessionRequest, McpServer, NewSessionRequest, Notification, PromptRequest, PromptResponse,
-    Request, RequestId, RequestPermissionRequest, RequestPermissionResponse, Response,
-    SessionConfigOption, SessionConfigOptionValue, SessionId, SessionInfo, SessionModeId,
-    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
+    ForkSessionRequest, ImageContent, InitializeRequest, JsonRpcMessage, ListSessionsRequest,
+    ListSessionsResponse, LoadSessionRequest, McpServer, NewSessionRequest, Notification,
+    PromptRequest, PromptResponse, Request, RequestId, RequestPermissionRequest,
+    RequestPermissionResponse, Response, SessionConfigOption, SessionConfigOptionValue, SessionId,
+    SessionInfo, SessionModeId, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
     SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse, StopReason,
     TextContent,
 };
@@ -36,7 +36,6 @@ use maki_config::{MAX_SERVER_NAME_LEN, ModelPolicy, ProjectConfig, SessionDefaul
 use maki_providers::model::Model;
 use maki_providers::model_registry;
 use maki_providers::provider::{available_model_specs, fetch_all_models};
-use maki_providers::spec::ProviderRegistry;
 use maki_providers::{add_cost, settle_session};
 use maki_storage::StateDir;
 use maki_storage::id::{MakiId, SessionRef};
@@ -105,8 +104,8 @@ struct SessionState {
 struct Server {
     out_tx: Sender<Value>,
     model_specs: Vec<String>,
-    /// One message per discovery batch, disconnected once discovery is done.
-    discovery_progress: Receiver<()>,
+    /// Discovered model batches, disconnected once discovery is done.
+    discovery: Receiver<Vec<String>>,
     model_policy: Arc<ModelPolicy>,
     client_elicits_form: bool,
     defaults: SessionDefaults,
@@ -139,11 +138,12 @@ pub async fn serve(params: AcpParams) -> color_eyre::Result<()> {
         }
     });
 
-    let (progress_tx, discovery_progress) = flume::unbounded();
+    let (discovery_tx, discovery) = flume::unbounded();
+    discover_models(Arc::clone(&params.model_policy), discovery_tx);
     let mut server = Server {
         out_tx,
         model_specs: available_model_specs(&params.model_policy),
-        discovery_progress,
+        discovery,
         model_policy: Arc::clone(&params.model_policy),
         client_elicits_form: false,
         defaults: params.defaults,
@@ -151,16 +151,10 @@ pub async fn serve(params: AcpParams) -> color_eyre::Result<()> {
         on_session_end: params.on_session_end.clone(),
     };
 
-    let (in_tx, in_rx) = flume::unbounded::<Incoming>();
-    // Weak, so a discovery still in flight cannot keep the loop alive once stdin closes.
-    discover_models(
-        Arc::clone(&params.model_policy),
-        in_tx.downgrade(),
-        progress_tx,
-    );
-    let reader_task = smol::spawn(read_stdin(in_tx));
+    let (line_tx, lines) = flume::unbounded();
+    let reader_task = smol::spawn(read_stdin(line_tx));
 
-    while let Ok(incoming) = in_rx.recv_async().await {
+    while let Some(incoming) = next_incoming(&lines, &server.discovery).await {
         match incoming {
             Incoming::Line(line) => handle_line(&mut server, &line, &params).await,
             Incoming::Models(specs) => refresh_models(&mut server, specs),
@@ -177,14 +171,14 @@ pub async fn serve(params: AcpParams) -> color_eyre::Result<()> {
 
 /// Lives in its own task because `read_line` is not cancel safe: the main loop
 /// waits on discovery too, and a dropped read would eat half a line.
-async fn read_stdin(tx: Sender<Incoming>) -> std::io::Result<()> {
+async fn read_stdin(tx: Sender<String>) -> std::io::Result<()> {
     let mut reader = smol::io::BufReader::new(smol::Unblock::new(std::io::stdin()));
     loop {
         let mut line = String::new();
         if reader.read_line(&mut line).await? == 0 {
             return Ok(());
         }
-        if tx.send_async(Incoming::Line(line)).await.is_err() {
+        if tx.send_async(line).await.is_err() {
             return Ok(());
         }
     }
@@ -195,15 +189,12 @@ async fn read_stdin(tx: Sender<Incoming>) -> std::io::Result<()> {
 /// in the background. Each batch leaves the moment it lands: the slowest source
 /// is a cold catalog download, and a provider the client could already pick from
 /// should not wait behind it.
-fn discover_models(policy: Arc<ModelPolicy>, tx: WeakSender<Incoming>, progress: Sender<()>) {
+fn discover_models(policy: Arc<ModelPolicy>, tx: Sender<Vec<String>>) {
     smol::spawn(async move {
         fetch_all_models(
             &policy,
             |batch| {
-                if let Some(tx) = tx.upgrade() {
-                    let _ = tx.send(Incoming::Models(batch.models));
-                }
-                let _ = progress.send(());
+                let _ = tx.send(batch.models);
             },
             None,
         )
@@ -212,19 +203,41 @@ fn discover_models(policy: Arc<ModelPolicy>, tx: WeakSender<Incoming>, progress:
     .detach();
 }
 
+/// Stops listening to discovery once it is done, so only stdin ends the loop.
+async fn next_incoming(
+    lines: &Receiver<String>,
+    discovery: &Receiver<Vec<String>>,
+) -> Option<Incoming> {
+    let batch = async {
+        match discovery.recv_async().await {
+            Ok(batch) => Some(Incoming::Models(batch)),
+            Err(_) => future::pending().await,
+        }
+    };
+    future::or(
+        async { lines.recv_async().await.ok().map(Incoming::Line) },
+        batch,
+    )
+    .await
+}
+
+fn merge_models(specs: &mut Vec<String>, batch: Vec<String>) -> bool {
+    let known = specs.len();
+    for spec in batch {
+        if !specs.contains(&spec) {
+            specs.push(spec);
+        }
+    }
+    specs.len() > known
+}
+
 /// Discovery lands in batches after the client built its selector from the
 /// offline list, so every batch that adds something announces the fuller list.
 fn refresh_models(srv: &mut Server, batch: Vec<String>) {
-    let known = srv.model_specs.len();
-    for spec in batch {
-        if !srv.model_specs.contains(&spec) {
-            srv.model_specs.push(spec);
-        }
-    }
-    if srv.model_specs.len() == known {
+    // Merged even with no session yet, since session/new builds its selector from this list.
+    if !merge_models(&mut srv.model_specs, batch) {
         return;
     }
-    // Merged even with no session yet, since session/new builds its selector from this list.
     let Some(session) = &srv.session else { return };
     let options =
         methods::config_options(&session.current_model, &srv.model_specs, session.thinking);
@@ -945,38 +958,39 @@ fn set_thinking(srv: &mut Server, value: &str) -> Result<(), AcpError> {
     Ok(())
 }
 
-/// Clients like bb read a model's thinking levels once, from the response that
-/// selects it, and providers like Copilot only report those levels through
-/// discovery. So the response waits for the model's provider to be discovered.
-async fn current_config_options(srv: &Server) -> Vec<SessionConfigOption> {
+/// Clients like bb build their model selector from the session/new response
+/// and read a model's thinking levels once, from the response that selects it.
+/// Copilot and friends only report both through discovery, so the response
+/// waits for discovery to finish.
+async fn current_config_options(srv: &mut Server) -> Vec<SessionConfigOption> {
+    await_discovery(srv).await;
     let Some(session) = &srv.session else {
         return Vec::new();
     };
-    await_discovery(&srv.discovery_progress, &session.current_model).await;
     methods::config_options(&session.current_model, &srv.model_specs, session.thinking)
 }
 
-async fn await_discovery(progress: &Receiver<()>, spec: &str) {
-    let Some(slug) = Model::from_spec(spec)
-        .ok()
-        .and_then(|model| ProviderRegistry::for_slug(&model.provider))
-        .map(|provider| provider.slug)
-    else {
-        return;
-    };
+/// Merges without announcing: the response these batches feed already carries
+/// them, and session/new must answer before an update names its session.
+async fn await_discovery(srv: &mut Server) {
     let mut deadline = Timer::after(DISCOVERY_WAIT);
-    while !model_registry::discovery_complete(slug) {
-        let progressed = future::or(async { progress.recv_async().await.is_ok() }, async {
+    loop {
+        let batch = future::or(async { Some(srv.discovery.recv_async().await) }, async {
             (&mut deadline).await;
-            false
+            None
         })
         .await;
-        if !progressed {
-            warn!(
-                spec,
-                "model discovery did not finish, thinking levels may be missing"
-            );
-            return;
+        match batch {
+            Some(Ok(batch)) => {
+                merge_models(&mut srv.model_specs, batch);
+            }
+            Some(Err(_)) => return,
+            None => {
+                warn!(
+                    "model discovery did not finish, the model list and thinking levels may be incomplete"
+                );
+                return;
+            }
         }
     }
 }
@@ -1561,13 +1575,15 @@ mod tests {
         })
     }
 
-    /// Copilot's offline row says nothing about thinking, so without waiting
-    /// the response that selects the model would carry no thinking option.
+    /// bb builds its selector from the session/new response alone, and
+    /// Copilot's offline rows miss both its newest models and their thinking.
     #[test]
-    fn config_options_wait_for_the_model_provider_discovery() {
-        let (mut srv, _answers, _out) = test_server();
-        let (progress_tx, progress) = flume::unbounded();
-        srv.discovery_progress = progress;
+    fn config_options_wait_for_discovery() {
+        let (mut srv, _answers, out_rx) = test_server();
+        let (discovery_tx, discovery) = flume::unbounded();
+        srv.discovery = discovery;
+        let copilot_spec = format!("{COPILOT_SLUG}/{COPILOT_MODEL_ID}");
+        let batch = vec![copilot_spec.clone(), DISCOVERED_SPEC.to_owned()];
         let discovery = std::thread::spawn(move || {
             model_registry::set_known_models(
                 COPILOT_SLUG,
@@ -1577,15 +1593,27 @@ mod tests {
                     ..ModelInfo::default()
                 }],
             );
-            progress_tx.send(()).unwrap();
+            discovery_tx.send(batch).unwrap();
         });
 
-        srv.session.as_mut().unwrap().current_model = format!("{COPILOT_SLUG}/{COPILOT_MODEL_ID}");
-        let options = smol::block_on(current_config_options(&srv));
+        srv.session.as_mut().unwrap().current_model = copilot_spec;
+        let options = smol::block_on(current_config_options(&mut srv));
         discovery.join().unwrap();
 
         let ids: Vec<&str> = options.iter().map(|option| option.id.0.as_ref()).collect();
         assert_eq!(ids, [methods::MODEL_CONFIG_ID, methods::THINKING_CONFIG_ID]);
+        let options = serde_json::to_value(&options[0]).unwrap();
+        let selectable: Vec<&str> = options["options"]
+            .as_array()
+            .expect("the option is a select")
+            .iter()
+            .filter_map(|o| o["value"].as_str())
+            .collect();
+        assert!(selectable.contains(&DISCOVERED_SPEC), "{selectable:?}");
+        assert!(
+            out_rx.is_empty(),
+            "the response carries the batch, no update does"
+        );
     }
 
     #[test_case("high", Some(StoredThinking::Effort { level: Effort::High }) ; "effort_level")]
@@ -1641,7 +1669,7 @@ mod tests {
         let server = Server {
             out_tx,
             model_specs: Vec::new(),
-            discovery_progress: flume::unbounded().1,
+            discovery: flume::unbounded().1,
             model_policy: Arc::new(ModelPolicy::default()),
             client_elicits_form: false,
             defaults: SessionDefaults::default(),
