@@ -768,7 +768,7 @@ async fn close_session(srv: &mut Server, reason: SessionEndReason) {
         let resp = PromptResponse::new(StopReason::Cancelled);
         send(
             &srv.out_tx,
-            Response::new(id, Ok(AgentResponse::PromptResponse(resp))),
+            Response::<AgentResponse>::new(id, Ok(AgentResponse::PromptResponse(resp))),
         );
     }
     state.handle.task.cancel().await;
@@ -1239,7 +1239,10 @@ fn start_event_pump(
                         let resp = PromptResponse::new(translate::map_done_reason(reason));
                         send(
                             &out_tx,
-                            Response::new(id, Ok(AgentResponse::PromptResponse(resp))),
+                            Response::<AgentResponse>::new(
+                                id,
+                                Ok(AgentResponse::PromptResponse(resp)),
+                            ),
                         );
                     }
                     continue;
